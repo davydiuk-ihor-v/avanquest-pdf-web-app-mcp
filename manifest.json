@@ -1,0 +1,301 @@
+{
+  "manifest_version": "0.4",
+  "name": "avanquest-pdf-mcp-editor",
+  "display_name": "Avanquest PDF Viewer",
+  "version": "0.4.146",
+  "description": "View PDF files inside Claude Desktop using the Avanquest PDF web viewer.",
+  "long_description": "Provides a display_pdf tool that opens a local PDF file in an interactive viewer rendered inline in the Claude Desktop chat. Powered by @avanquest/pdf-web-viewer.",
+  "author": {
+    "name": "Avanquest",
+    "email": "pdfsupport@avanquest.com",
+    "url": "https://developers.avanquest.com"
+  },
+  "homepage": "https://developers.avanquest.com",
+  "license": "MIT",
+  "icon": "icon.png",
+  "privacy_policies": [
+    "https://developers.avanquest.com/privacy-policy"
+  ],
+  "support": "mailto:support@avanquest.com",
+  "documentation": "https://developers.avanquest.com",
+  "keywords": [
+    "pdf",
+    "pdf viewer",
+    "pdf editor",
+    "annotate",
+    "rotate pages",
+    "merge",
+    "split",
+    "compress",
+    "insert page",
+    "add image"
+  ],
+  "server": {
+    "type": "node",
+    "entry_point": "dist/server.js",
+    "mcp_config": {
+      "command": "node",
+      "args": [
+        "${__dirname}/dist/server.js"
+      ],
+      "env": {
+        "PWV_LICENSE_KEY": "${user_config.license_key}",
+        "PWV_ALLOWED_DIRS_LIST": "${user_config.allowed_dir_1}"
+      }
+    }
+  },
+  "user_config": {
+    "license_key": {
+      "type": "string",
+      "title": "Avanquest PDF license key",
+      "description": "Your @avanquest/pdf-web-viewer license key. Required to render PDFs.",
+      "sensitive": true,
+      "required": true
+    },
+    "allowed_dir_1": {
+      "type": "directory",
+      "title": "Default folder",
+      "description": "First folder the viewer may open PDFs from. Leave all folders empty to use defaults (Documents, Downloads, Desktop, PDF).",
+      "required": false
+    }
+  },
+  "tools": [
+    {
+      "name": "display_pdf",
+      "description": "Open a PDF in the embedded Avanquest PDF viewer. Accepts either a local file path or a remote URL."
+    },
+    {
+      "name": "close_document",
+      "description": "Close the currently open document in the PDF viewer."
+    },
+    {
+      "name": "get_view_state",
+      "description": "Return current viewing state: 1-based current page number, total page count, document title, and file path."
+    },
+    {
+      "name": "set_view_state",
+      "description": "Navigate to a specific page in the currently open PDF document."
+    },
+    {
+      "name": "read_document_information",
+      "description": "Read metadata of the currently open PDF: page count, title, author, creator, producer, creation and modification dates, file size in bytes, and status flags (isSigned, isModified, isReadOnly)."
+    },
+    {
+      "name": "read_page_info",
+      "description": "Read width, height (in PDF points), and rotation for a specific page in the currently open document."
+    },
+    {
+      "name": "save_pdf",
+      "description": "Save edited PDF bytes back to the file system"
+    },
+    {
+      "name": "save_as",
+      "description": "Save the currently open PDF as a new file (copy) without closing it."
+    },
+    {
+      "name": "compress_pdf",
+      "description": "Compress a PDF file to reduce its size — runs entirely on the server, no viewer needed. Accepts path (required), quality (min/low/medium/high/max, default: medium), and optional outputPath. Returns original size, compressed size, and reduction percentage."
+    },
+    {
+      "name": "merge_pdf",
+      "description": "Merge multiple PDF files into a single PDF. Accepts paths (array of absolute file paths, minimum 2), and optional outputPath."
+    },
+    {
+      "name": "split_pdf",
+      "description": "Split a PDF into multiple files. Accepts path (required), plus either: ranges (array of page range strings like [\"1-3\",\"4-6\"]) OR pagesPerFile (number). Optional outputDir. Returns list of created files."
+    },
+    {
+      "name": "rotate_pages",
+      "description": "Rotate pages in the currently open PDF viewer. Use pages for specific 1-based page numbers (e.g. [1,3]), or omit to rotate all pages. Angle: 90, 180, or 270."
+    },
+    {
+      "name": "insert_blank_page",
+      "description": "Insert a blank page into the currently open PDF. Use after_page: 0 for first position, after_page: N to insert after page N, or omit to append at the end."
+    },
+    {
+      "name": "add_image_to_page",
+      "description": "Insert an image onto a specific page of the currently open PDF. Accepts image_svg (SVG markup — preferred for generated graphics), a remote URL, or a local file path. Position and size are optional percentages of the page dimensions."
+    },
+    {
+      "name": "read_bookmarks",
+      "description": "List all bookmarks (table of contents) from the currently open PDF with title, page number and nesting path."
+    },
+    {
+      "name": "add_bookmark",
+      "description": "Add a bookmark to the currently open PDF pointing to a specific page."
+    },
+    {
+      "name": "delete_bookmark",
+      "description": "Delete a bookmark by its tree path (array of 0-based indices)."
+    },
+    {
+      "name": "delete_all_bookmarks",
+      "description": "Remove all bookmarks from the currently open PDF."
+    },
+    {
+      "name": "extract_images",
+      "description": "Extract all embedded raster images from the currently open PDF and save them as a ZIP archive."
+    },
+    {
+      "name": "export_comments",
+      "description": "Export all annotations and comments from the currently open PDF as an FDF file."
+    },
+    {
+      "name": "resize_pages",
+      "description": "Change the page canvas size of one or more pages in the currently open PDF. Accepts a named preset (A4, A3, Letter, etc.) or custom width/height in PDF points."
+    },
+    {
+      "name": "delete_pages",
+      "description": "Delete one or more pages from the currently open PDF by their 1-based page numbers."
+    },
+    {
+      "name": "move_pages",
+      "description": "Move pages to a different position in the currently open PDF."
+    },
+    {
+      "name": "duplicate_pages",
+      "description": "Duplicate pages and insert copies at a specified position in the currently open PDF."
+    },
+    {
+      "name": "reverse_pages",
+      "description": "Reverse the page order of the currently open PDF, optionally for a subset of pages."
+    },
+    {
+      "name": "undo",
+      "description": "Undo the last action in the currently open PDF document."
+    },
+    {
+      "name": "redo",
+      "description": "Redo the last undone action in the currently open PDF document."
+    },
+    {
+      "name": "add_annotation",
+      "description": "Add a shape annotation to the currently open PDF viewer without reloading. Supported shapes: oval, rectangle, rhombus, line, arrow. Position and size are percentages of page dimensions (0–100)."
+    },
+    {
+      "name": "update_annotation",
+      "description": "Modify properties of an existing annotation in place: stroke color, fill color, opacity, or text content (for FreeText annotations). Use read_annotations first to get the annotation index."
+    },
+    {
+      "name": "delete_annotation",
+      "description": "Delete an annotation from the currently open PDF by page and annotation index. Use read_annotations to list annotations and their indices first."
+    },
+    {
+      "name": "read_annotations",
+      "description": "List all annotations on a page (or the whole document). Returns index, type, position, color, and comment for each annotation."
+    },
+    {
+      "name": "update_document_properties",
+      "description": "Change metadata properties (title, author, subject, keywords) of the currently open PDF."
+    },
+    {
+      "name": "add_text_to_page",
+      "description": "Add a plain text label or annotation to a page in the currently open PDF. Use to add labels or headers above form fields."
+    },
+    {
+      "name": "add_form_field",
+      "description": "Add a fillable form field (text box, checkbox, dropdown, etc.) to a page in the currently open PDF. Position and size are percentages of page dimensions."
+    },
+    {
+      "name": "read_form_fields",
+      "description": "List all fillable form fields (AcroForm) in the currently open PDF with their names, types, current values, and options."
+    },
+    {
+      "name": "update_form_field",
+      "description": "Set the value of a fillable form field in the currently open PDF by its field name."
+    },
+    {
+      "name": "read_page_text_blocks",
+      "description": "List all text blocks on a page with index and full text — use before format_text to inspect text structure."
+    },
+    {
+      "name": "format_text",
+      "description": "Apply font formatting (size, family, bold, italic, underline, strikeout, color, highlight) to a text fragment in the currently open PDF."
+    },
+    {
+      "name": "apply_redactions",
+      "description": "Permanently burn all existing redaction annotations (already marked areas) into the page content of the currently open PDF. To redact by text content, use search_and_redact instead. This action cannot be undone."
+    },
+    {
+      "name": "delete_bates_numbering",
+      "description": "Remove all Bates numbering from the currently open PDF."
+    },
+    {
+      "name": "delete_watermark",
+      "description": "Remove watermarks from the specified page range of the currently open PDF."
+    },
+    {
+      "name": "delete_header",
+      "description": "Remove headers and footers from the specified page range of the currently open PDF."
+    },
+    {
+      "name": "delete_page_number",
+      "description": "Remove page numbers from the currently open PDF."
+    },
+    {
+      "name": "delete_text_blocks",
+      "description": "Delete one or more editable text blocks from a page in the currently open PDF. Use read_page_text_blocks first to get 0-based block indices. Page is 1-based (same as all other tools)."
+    },
+    {
+      "name": "convert_to_images",
+      "description": "Convert all pages of the currently open PDF to PNG images and save them as a ZIP archive."
+    },
+    {
+      "name": "extract_pages",
+      "description": "Extract specific pages from the currently open PDF and save them as a new PDF file."
+    },
+    {
+      "name": "search_in_pdf",
+      "description": "Search for text in the currently open PDF. Highlights all matches in the viewer and returns the total match count and 1-based page numbers where matches were found."
+    },
+    {
+      "name": "navigate_search_result",
+      "description": "Navigate to the next or previous search result in the currently open PDF viewer. Requires search_in_pdf to have been called first."
+    },
+    {
+      "name": "read_text",
+      "description": "Extract all text content from the currently open PDF document as a plain string."
+    },
+    {
+      "name": "replace_text",
+      "description": "Find and replace text in the content of the currently open PDF. Works on native PDF text content across the specified page or all pages."
+    },
+    {
+      "name": "get_page_image",
+      "description": "Render a page of the currently open PDF as a PNG image so it can be visually inspected."
+    },
+    {
+      "name": "search_and_redact",
+      "description": "Find all occurrences of the specified text in the currently open PDF, mark them as redaction annotations, and permanently apply the redactions."
+    },
+    {
+      "name": "set_security_permissions",
+      "description": "Set password protection and access permissions on the currently open PDF. Supports user_password (open password), owner_password (permissions password), encryption (AES-256 default), and individual flags: allow_printing, allow_copying, allow_editing, allow_annotations, allow_forms."
+    },
+    {
+      "name": "circle_text",
+      "description": "Find all occurrences of a word or phrase in the currently open PDF and draw a rectangle or oval around each one. If shape or color not specified, ask the user first."
+    },
+    {
+      "name": "get_selection_info",
+      "description": "Read info about the currently selected text in the PDF viewer: the text content and its font attributes (family, size, style, colors)."
+    },
+    {
+      "name": "format_selected_text",
+      "description": "Apply font formatting (bold, italic, font family, size, color, highlight, underline, strikeout) to the currently selected text in the PDF viewer."
+    },
+    {
+      "name": "reset_selection",
+      "description": "Clear the current text selection in the PDF viewer (remove the blue highlight from selected text)."
+    },
+    {
+      "name": "insert_page_number",
+      "description": "Add page numbers to the currently open PDF. Format: plain (%1%), dash (-%1%-), Page N, N of M, N/M, Page N of M. Position: top/bottom × left/center/right. Font: family, size (pt), color (hex). Range: specific pages or all. Start number: offset for multi-file documents."
+    }
+  ],
+  "compatibility": {
+    "runtimes": {
+      "node": ">=20"
+    }
+  }
+}

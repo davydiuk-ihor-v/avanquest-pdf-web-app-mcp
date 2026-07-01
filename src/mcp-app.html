@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Avanquest PDF Viewer</title>
+    <style>
+      html, body { margin: 0; padding: 0; width: 100%; overflow: hidden; }
+      body { min-height: 720px; background: #fff; }
+      #status {
+        display: none;
+        position: absolute; top: 16px; left: 16px; right: 16px; z-index: 1000;
+        font: 13px ui-monospace, Menlo, monospace;
+        background: #fff; border: 1px solid #ccc; padding: 8px 12px; border-radius: 4px;
+        white-space: pre-wrap;
+      }
+      #viewer { height: 720px; width: 100%; }
+      #fullscreen-btn {
+        display: none;
+        position: fixed;
+        bottom: 10px;
+        right: 10px;
+        width: 28px;
+        height: 28px;
+        background: rgba(40,40,40,0.85);
+        border: 1px solid rgba(255,255,255,0.25);
+        border-radius: 5px;
+        cursor: pointer;
+        align-items: center;
+        justify-content: center;
+        z-index: 9999;
+        transition: background 0.15s;
+      }
+      #fullscreen-btn:hover { background: rgba(70,70,70,0.95); }
+      #fullscreen-btn svg { width: 14px; height: 14px; fill: none; stroke: #ddd; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+    </style>
+  </head>
+  <body>
+    <div id="status">loading…</div>
+    <div id="viewer"></div>
+    <button id="fullscreen-btn" title="Expand"></button>
+    <script>
+      window.PWV_CONFIG = { base: "%%PWV_BASE%%", license: "%%PWV_LICENSE%%", proxy: "%%PWV_PROXY%%" };
+    </script>
+    <script type="module" src="./mcp-app.ts"></script>
+  </body>
+</html>

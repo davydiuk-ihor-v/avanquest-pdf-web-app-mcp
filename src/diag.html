@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>PWV Diagnostics</title>
+    <style>
+      body { font: 13px ui-monospace, Menlo, monospace; padding: 12px; background: #fff; color: #222; }
+      pre { white-space: pre-wrap; }
+    </style>
+  </head>
+  <body>
+    <h3>PWV diagnostics v0.3.0</h3>
+    <pre id="out">static html rendered OK
+</pre>
+    <script>
+      window.PWV_CONFIG = { base: "%%PWV_BASE%%", license: "%%PWV_LICENSE%%" };
+    </script>
+    <script type="module" src="./diag.ts"></script>
+  </body>
+</html>

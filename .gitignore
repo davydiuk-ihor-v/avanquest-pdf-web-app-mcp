@@ -1,0 +1,14 @@
+node_modules/
+dist/
+*.mcpb
+.env
+TOOLS.md
+
+# Internal dev notes — not for public repo
+DEBUG_SESSION.md
+SOLUTION_EXPLANATION.md
+
+# Claude Code project memory
+.claude/
+SECURITY.md
+src/.DS_Store
