@@ -10,6 +10,8 @@
     "build": "npm run build:ui && npm run build:server",
     "start": "node dist/server.js",
     "dev": "tsx watch src/server.ts",
+    "dev:http": "tsx watch src/server.http.ts",
+    "start:http": "node dist/server.http.js",
     "inspect": "npx @modelcontextprotocol/inspector node dist/server.js",
     "pack": "node scripts/bump-version.mjs && npm run build && mcpb pack . avanquest-pdf-mcp-editor.mcpb"
   },
