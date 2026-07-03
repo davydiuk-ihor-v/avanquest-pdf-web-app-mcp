@@ -2,7 +2,7 @@
   "manifest_version": "0.4",
   "name": "avanquest-pdf-mcp-editor",
   "display_name": "Avanquest PDF Viewer",
-  "version": "0.4.152",
+  "version": "0.4.154",
   "description": "View PDF files inside Claude Desktop using the Avanquest PDF web viewer.",
   "long_description": "Provides a display_pdf tool that opens a local PDF file in an interactive viewer rendered inline in the Claude Desktop chat. Powered by @avanquest/pdf-web-viewer.",
   "author": {
