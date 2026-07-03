@@ -3014,16 +3014,27 @@ app.ontoolresult = (result) => {
 
 // ── get_selection_info ───────────────────────────────────────────────────────
 
+// Text can be selected either while copying text from the page ('TextCopy')
+// or while editing text inside a text-box/annotation ('TextEdit'). Both selection
+// implementations store the underlying caret in the same `selectCaret` field, but
+// 'TextEdit' overrides getSelectionData() to return its transformer instead, so we
+// must read the field directly rather than going through getSelectionData().
+function getTextSelectionCaret(dv: any): any {
+  const selType: string | null = dv?.getSelectionType?.() ?? null;
+  if (selType !== 'TextCopy' && selType !== 'TextEdit') return null;
+  const sel = dv?.getSelection?.();
+  if (!sel) return null;
+  return sel.selectCaret ?? sel.getSelectionData?.() ?? null;
+}
+
 async function handleGetSelectionInfo(): Promise<void> {
   try {
     const dv = _currentDocumentView as any;
-    const selType: string | null = dv?.getSelectionType?.() ?? null;
-    const isTextSelection = selType === 'TextCopy';
-    const caret = isTextSelection ? dv?.getSelection?.()?.getSelectionData?.() : null;
+    const caret = getTextSelectionCaret(dv);
     const text: string | null = caret?.getSelectedText?.() ?? null;
     const range = caret?.getSelectedRange?.();
     const font: unknown = (range && !range.empty?.()) ? (caret?.getFontAttributes?.(range.begin) ?? null) : null;
-    const hasSelection = isTextSelection && text !== null;
+    const hasSelection = caret !== null && text !== null;
     await (app as any).callServerTool({
       name: 'report_viewer_result',
       arguments: { type: 'get_selection_info', json: JSON.stringify({ hasSelection, text, fontAttributes: font }) },
@@ -3051,7 +3062,7 @@ async function handleFormatSelectedText(data: {
 }): Promise<void> {
   try {
     const dv = _currentDocumentView as any;
-    const caret = dv?.getSelectionType?.() === 'TextCopy' ? dv?.getSelection?.()?.getSelectionData?.() : null;
+    const caret = getTextSelectionCaret(dv);
     if (!caret) throw new Error('No text selected in viewer. Select text first, then call this tool.');
 
     const range = caret.getSelectedRange?.();
