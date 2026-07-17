@@ -76,14 +76,21 @@ window.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
   return nativeFetch(input, init);
 }) as typeof window.fetch;
 
+let _statusHideTimer: ReturnType<typeof setTimeout> | undefined;
 function show(msg: string, isError = false): void {
   if (!isError && !DEBUG_UI) { beacon(msg); return; }
+  if (_statusHideTimer !== undefined) { clearTimeout(_statusHideTimer); _statusHideTimer = undefined; }
   statusEl.style.display = 'block';
   statusEl.style.background = isError ? '#fee' : '#fff';
   statusEl.style.border = isError ? '1px solid #f33' : '1px solid #ccc';
   statusEl.style.color = isError ? '#900' : '#333';
   statusEl.textContent = msg;
   beacon(isError ? `ERROR: ${msg}` : msg);
+  // Auto-dismiss error toasts so they don't linger on screen forever. Success
+  // messages are hidden by their own handlers (and aren't shown in production).
+  if (isError) {
+    _statusHideTimer = setTimeout(() => { statusEl.style.display = 'none'; _statusHideTimer = undefined; }, 6000);
+  }
 }
 
 beacon(`boot: js running, location=${location.href}, base=${base}, license=${license ? 'set' : 'MISSING'}`);
@@ -2173,11 +2180,32 @@ async function handleUpdateDocumentProperties(data: { title: string | null; auth
   }
 }
 
+// Normalise an AcroForm choice item (dropdown/listbox option) to { name, value }.
+// PDF /Opt entries can be a plain string, a two-element [exportValue, displayText]
+// array, or an object — handle all three so options are never reported as undefined.
+function normalizeChoiceItem(it: any): { name: string; value: string } {
+  if (Array.isArray(it)) {
+    const value = String(it[0] ?? '');
+    const name = String(it[1] ?? it[0] ?? '');
+    return { name, value };
+  }
+  if (it && typeof it === 'object') {
+    const value = String(it.value ?? it.name ?? '');
+    const name = String(it.name ?? it.value ?? '');
+    return { name, value };
+  }
+  const s = String(it);
+  return { name: s, value: s };
+}
+
 async function handleReadFormFields(): Promise<void> {
   try {
     const doc = (_currentDocumentView as any)?.getDocument?.();
     if (!doc) throw new Error('document not available');
     const raw: any[] = doc.acroforms ?? [];
+    // Read the real on-state values of button fields once so checkboxes and, in
+    // particular, radio groups report the exact values needed to select them.
+    const onValuesByField = await collectButtonOnValues(doc);
     const fields = raw.map((f: any) => {
       let type = f.type as string;
       if (type === 'Tx') type = 'text';
@@ -2192,9 +2220,22 @@ async function handleReadFormFields(): Promise<void> {
       };
       if (f.uiFieldName && f.uiFieldName !== f.fieldName) entry.ui_name = f.uiFieldName;
       if ((type === 'dropdown' || type === 'listbox') && Array.isArray(f.items) && f.items.length > 0) {
-        entry.options = f.items.map((it: any) =>
-          typeof it === 'object' && it !== null ? { name: it.name ?? it.value, value: it.value } : String(it)
-        );
+        entry.options = f.items.map(normalizeChoiceItem);
+      }
+      if (type === 'check' || type === 'radio' || type === 'checkbox' || type === 'button') {
+        // A checkbox/radio is "on" when its value is anything other than the
+        // Off/empty state.
+        const v = String(f.value ?? '');
+        entry.checked = v !== '' && v.toLowerCase() !== 'off';
+        const onValues = onValuesByField.get(f.fieldName) ?? [];
+        if (type === 'radio' || onValues.length > 1) {
+          // Radio group: expose the selectable option values in order so the
+          // caller can pass an exact value or a 1-based index to update_form_field.
+          if (onValues.length > 0) entry.options = onValues.slice();
+        } else if (onValues.length === 1) {
+          // Single checkbox: report its on-value ("yes"/"true"/"1" also work).
+          entry.on_value = onValues[0];
+        }
       }
       return entry;
     });
@@ -2212,23 +2253,226 @@ async function handleReadFormFields(): Promise<void> {
   }
 }
 
+const FALSY_FORM_VALUES = new Set(['', 'off', 'no', 'false', '0', 'unchecked', 'none', 'n']);
+const TRUTHY_FORM_VALUES = new Set(['on', 'yes', 'true', '1', 'checked', 'check', 'x', 'y']);
+
+// Did the change actually take effect? changeAcroformValue is a no-op when the
+// value doesn't match what the field accepts — in that case `changed` is empty.
+function changeApplied(result: any): boolean {
+  const changed = result?.changed;
+  if (!changed) return false;
+  if (Array.isArray(changed)) return changed.length > 0;
+  if (Array.isArray(changed.pages)) return changed.pages.length > 0;
+  return true;
+}
+
+async function tryChangeAcroform(doc: any, field: string, value: string): Promise<boolean> {
+  try {
+    const result = await doc.changeAcroformValue({ field, value });
+    return changeApplied(result);
+  } catch {
+    return false;
+  }
+}
+
+// Read the real "on" state name(s) of checkbox/radio fields from their widget
+// annotations. In the engine, a widget annotation exposes its on-state via the
+// `V` key (a constant per widget, distinct from the field's current value), and
+// this is exactly what the viewer uses to toggle the control on click. The
+// on-state is frequently NOT "Yes" (it can be "On", "1", a per-option name, …),
+// so we must read it rather than guess. A single scan returns a map from field
+// name to its distinct on-values, in widget order (which matches the visual
+// order of the radio options — index i is the (i+1)-th option).
+async function collectButtonOnValues(doc: any): Promise<Map<string, string[]>> {
+  const map = new Map<string, string[]>();
+  const pdfEditor = doc?.pdfEditor;
+  const docId = doc?.id;
+  if (!pdfEditor || docId === undefined) return map;
+  const pageCount = (doc.getNumPages?.() ?? 0) as number;
+  for (let pi = 0; pi < pageCount; pi++) {
+    let annots: any[] = [];
+    try {
+      annots = await pdfEditor.getPageAnnotations({ documentId: docId, index: pi });
+    } catch {
+      continue;
+    }
+    for (const a of annots ?? []) {
+      if (a?.T !== 'Widget') continue;
+      const field = typeof a.P === 'string' ? a.P : '';
+      if (!field) continue;
+      const v = typeof a.V === 'string' ? a.V : '';
+      if (v === '' || v.toLowerCase() === 'off') continue;
+      let list = map.get(field);
+      if (!list) { list = []; map.set(field, list); }
+      if (!list.includes(v)) list.push(v);
+    }
+  }
+  return map;
+}
+
+async function getButtonOnValues(doc: any, fieldName: string): Promise<string[]> {
+  const map = await collectButtonOnValues(doc);
+  return map.get(fieldName) ?? [];
+}
+
+const CHOICE_EDIT_FLAG = 262144; // kPDChoiceFieldFlagEdit — combo accepts free text
+
+// Resolve a dropdown/listbox input to the option the caller meant. Matching is
+// intentionally forgiving so natural inputs work:
+//   • exact name / export-value (case-insensitive, trimmed)
+//   • numeric equivalence ("2" ↔ "02", "2022" ↔ "2022")
+//   • prefix either way, ≥3 chars ("Feb" ↔ "February", "Sept" ↔ "Sep")
+//   • a bare integer as a 1-based option index (month number "2" → 2nd option)
+// For an editable combo (Edit flag) an unmatched input becomes free text.
+// Returns the option ({name, value}) or null when no option matches.
+function resolveChoiceOption(field: any, input: string): { name: string; value: string } | null {
+  const items = (Array.isArray(field.items) ? field.items : []).map(normalizeChoiceItem);
+  const raw = input.trim();
+  const editable = ((field.fieldFlags ?? 0) & CHOICE_EDIT_FLAG) !== 0;
+  if (items.length === 0) return { name: raw, value: raw }; // free text / no option list
+  const norm = raw.toLowerCase();
+  const num = Number(raw);
+  const isNum = raw !== '' && Number.isFinite(num);
+
+  for (const it of items) if (it.name.toLowerCase() === norm) return it;
+  for (const it of items) if (it.value.toLowerCase() === norm) return it;
+  if (isNum) {
+    for (const it of items) {
+      const nn = Number(it.name); const nv = Number(it.value);
+      if ((it.name !== '' && Number.isFinite(nn) && nn === num) ||
+          (it.value !== '' && Number.isFinite(nv) && nv === num)) return it;
+    }
+  }
+  if (norm.length >= 3) {
+    for (const it of items) {
+      const n = it.name.toLowerCase();
+      if (n.length >= 3 && (n.startsWith(norm) || norm.startsWith(n))) return it;
+    }
+  }
+  if (isNum && Number.isInteger(num) && num >= 1 && num <= items.length) return items[num - 1];
+  return editable ? { name: raw, value: raw } : null;
+}
+
 async function handleUpdateFormField(data: { field_name: string; value: string }): Promise<void> {
   try {
     const doc = (_currentDocumentView as any)?.getDocument?.();
     if (!doc) throw new Error('document not available');
-    await (doc as any).changeAcroformValue({ field: data.field_name, value: data.value });
+
+    const fields: any[] = doc.acroforms ?? [];
+    const field = fields.find((f: any) => f.fieldName === data.field_name);
+    if (!field) {
+      const names = fields.map((f: any) => f.fieldName).filter(Boolean);
+      const available = names.length > 0 ? `Available fields: ${names.join(', ')}` : 'This document has no form fields.';
+      throw new Error(`form field not found: "${data.field_name}". ${available}`);
+    }
+    if (field.isReadOnly?.()) throw new Error(`form field is read-only: "${data.field_name}"`);
+
+    const rawType = field.type as string; // 'Tx' | 'Btn' | 'Ch' | 'Sig'
+    const currentValue = String(field.value ?? '');
+    let applied = false;
+    let appliedValue = data.value;
+
+    if (rawType === 'Btn') {
+      // Checkbox / radio button. The engine unchecks with an empty string and
+      // checks with the widget's real on-state value (often NOT "Yes"). Read the
+      // on-state(s) from the widget annotations so the correct value is used.
+      const norm = data.value.trim().toLowerCase();
+      const currentlyChecked = currentValue !== '' && currentValue.toLowerCase() !== 'off';
+      const onValues = await getButtonOnValues(doc, data.field_name);
+      const isRadio = field.buttonType === 'radio' || onValues.length > 1;
+      if (FALSY_FORM_VALUES.has(norm)) {
+        // The viewer unchecks with an empty string; fall back to "Off" if the
+        // engine rejects it. Report "Off" as the resulting state either way.
+        appliedValue = 'Off';
+        applied = !currentlyChecked ||
+                  (await tryChangeAcroform(doc, data.field_name, '')) ||
+                  (await tryChangeAcroform(doc, data.field_name, 'Off'));
+      } else if (isRadio) {
+        // Radio group: select one specific option. Each option is identified by
+        // its on-value (from the widgets, in visual order). Accept either the
+        // exact on-value or a 1-based ordinal index ("2" = second option). Never
+        // fall back to the first option — that silently ignores the request.
+        let target = onValues.find((v) => v.toLowerCase() === norm);
+        if (!target && /^\d+$/.test(norm)) {
+          const idx = parseInt(norm, 10) - 1;
+          if (idx >= 0 && idx < onValues.length) target = onValues[idx];
+        }
+        if (!target) {
+          const list = onValues.length > 0
+            ? `Its options (in order) are: ${onValues.map((v, i) => `${i + 1}=${v}`).join(', ')}.`
+            : 'No selectable options were found on its widgets.';
+          throw new Error(`"${data.field_name}" is a radio group; pass one of its option values or a 1-based index. ${list}`);
+        }
+        appliedValue = target;
+        applied = target === currentValue || (await tryChangeAcroform(doc, data.field_name, target));
+      } else {
+        // Single checkbox: check it using the widget's real on-value, falling
+        // back to common guesses only when no on-state could be read.
+        if (currentlyChecked && (onValues.length === 0 || onValues.includes(currentValue))) {
+          appliedValue = currentValue;
+          applied = true;
+        } else {
+          const candidates = [...onValues];
+          if (!TRUTHY_FORM_VALUES.has(norm) && data.value !== '') candidates.push(data.value);
+          candidates.push('Yes', 'On', '1', field.selfName || field.fieldName, data.field_name);
+          const tried = new Set<string>();
+          for (const c of candidates) {
+            if (!c || tried.has(c)) continue;
+            tried.add(c);
+            if (await tryChangeAcroform(doc, data.field_name, c)) {
+              applied = true;
+              appliedValue = c;
+              break;
+            }
+          }
+        }
+      }
+    } else if (rawType === 'Ch') {
+      // Dropdown / listbox. Set the option's display NAME — the engine keys the
+      // rendered selection off the label (a value not among the labels shows
+      // blank). Fall back to the export value only if the label is rejected.
+      // (We can't verify via the widget: these combos keep the value on the
+      // field, not the widget annotation, so its `V` reads empty.)
+      const opts = (Array.isArray(field.items) ? field.items : []).map(normalizeChoiceItem);
+      const target = resolveChoiceOption(field, data.value);
+      if (target === null) {
+        const list = opts.map((o: { name: string; value: string }) => (o.name === o.value ? o.value : `${o.name} (${o.value})`)).join(', ');
+        throw new Error(`value "${data.value}" is not a valid option for "${data.field_name}". Available: ${list || '(none)'}`);
+      }
+      appliedValue = target.name;
+      applied = target.name === currentValue ||
+                (await tryChangeAcroform(doc, data.field_name, target.name)) ||
+                (target.value !== target.name && (await tryChangeAcroform(doc, data.field_name, target.value)));
+      if (!applied) {
+        const list = opts.map((o: { name: string; value: string }) => (o.name === o.value ? o.value : `${o.name} (${o.value})`)).join(', ');
+        throw new Error(`value "${data.value}" did not take effect on "${data.field_name}". Valid options: ${list || '(none)'}`);
+      }
+    } else {
+      // Text field (or signature) — set the value verbatim.
+      applied = data.value === currentValue || (await tryChangeAcroform(doc, data.field_name, data.value));
+    }
+
+    if (!applied) {
+      throw new Error(`the engine did not accept value "${data.value}" for field "${data.field_name}"`);
+    }
+
+    // Keep the in-memory field value in sync so read_form_fields reflects the
+    // change, and refresh the viewer so the update is visible immediately.
+    try { field.value = appliedValue; } catch (_) {}
+    (_currentDocumentView as any)?.invalidate?.();
+
     show('Form field updated');
     setTimeout(() => { statusEl.style.display = 'none'; }, 2000);
     await (app as any).callServerTool({
       name: 'report_viewer_result',
-      arguments: { type: 'update_form_field', json: JSON.stringify({ success: true }) },
+      arguments: { type: 'update_form_field', json: JSON.stringify({ success: true, applied_value: appliedValue }) },
     });
   } catch (err) {
     show(`update_form_field error: ${err instanceof Error ? err.message : String(err)}`, true);
     try {
       await (app as any).callServerTool({
         name: 'report_viewer_result',
-        arguments: { type: 'update_form_field', json: JSON.stringify({ success: false, error: String(err) }) },
+        arguments: { type: 'update_form_field', json: JSON.stringify({ success: false, error: err instanceof Error ? err.message : String(err) }) },
       });
     } catch (_) {}
   }
