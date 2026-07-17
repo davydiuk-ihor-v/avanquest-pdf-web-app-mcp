@@ -1609,7 +1609,7 @@ async function main(): Promise<void> {
     {
       title: 'Read Form Fields',
       annotations: { readOnlyHint: true },
-      description: 'List all fillable form fields (AcroForm) in the currently open PDF with their names, types, current values, and available options.',
+      description: 'List all fillable form fields (AcroForm) in the currently open PDF: names, types, current values, checkbox/radio checked state, checkbox on_value, radio-group option values (in selectable order), and dropdown options (name and export value).',
       inputSchema: {},
     },
     async () =>
@@ -1631,20 +1631,21 @@ async function main(): Promise<void> {
     {
       title: 'Update Form Field',
       annotations: { readOnlyHint: false, destructiveHint: false },
-      description: 'Set the value of a fillable form field in the currently open PDF. Use read_form_fields first to get the exact field_name. For checkboxes use "Yes"/"Off", for radio buttons use the button\'s on-value, for dropdowns use one of the available options.',
+      description: 'Set the value of a fillable form field in the currently open PDF. Call read_form_fields first to get the exact field_name and options. Checkboxes: pass "yes"/"true"/"1" to check (the correct on-value is resolved automatically) or "no"/"false"/"off" to uncheck. Radio groups: pass one of the option values listed in read_form_fields OR a 1-based index ("2" selects the second option). Dropdowns/listboxes: pass an option name or value. Text fields: the literal text. The result reports the value actually applied and fails clearly if the engine did not accept it.',
       inputSchema: {
         field_name: z.string().describe('Exact field name from read_form_fields'),
-        value: z.string().describe('New value to set'),
+        value: z.string().describe('New value. Checkbox: yes/no. Radio: an option value or 1-based index. Dropdown: an option name/value. Text: the literal text.'),
       },
     },
     async ({ field_name, value }) =>
-      pollViewerResult<{ success: boolean; error?: string }>(
+      pollViewerResult<{ success: boolean; error?: string; applied_value?: string }>(
         { type: 'update_form_field', field_name, value },
         'update_form_field',
         10_000,
         (d) => {
           if (!d.success) return nok(`Error: ${d.error}`);
-          return ok(`Field "${field_name}" updated to "${value}".`);
+          const applied = d.applied_value ?? value;
+          return ok(`Field "${field_name}" set to "${applied}".`);
         },
       ),
   );
