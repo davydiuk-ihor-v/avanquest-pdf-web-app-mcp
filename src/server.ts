@@ -14,20 +14,32 @@ import { createReadStream, existsSync, realpathSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { randomUUID, createHash } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
+import { ensureAuthenticated, type AuthState } from './auth.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// The license key is collected per-user via the mcpb `user_config` prompt
-// (manifest -> PWV_LICENSE_KEY env). NO key is committed to source or shipped in
-// the bundle. For local `npm start`, export PWV_LICENSE_KEY. An unsubstituted
-// `${user_config...}` placeholder (host left it literal when unset) is ignored.
-const envLicense = process.env.PWV_LICENSE_KEY?.trim();
-const LICENSE_KEY = envLicense && !envLicense.includes('${') ? envLicense : '';
-if (!LICENSE_KEY) {
-  console.error('[avanquest-pdf] No license key configured (set PWV_LICENSE_KEY). The viewer will report a licensing error.');
+// The license key used to be collected per-user via the mcpb `user_config`
+// prompt (manifest -> PWV_LICENSE_KEY env). It's now obtained automatically
+// via browser-based login against the same upstream IdP pdf-claude-viewer
+// uses (see auth.ts) -- ensureAuthenticated() opens the system browser on
+// first run and caches tokens/license in the user's home directory across
+// restarts. Kicked off in main() so it doesn't block the MCP handshake; tool
+// handlers await the same in-flight promise before using the license.
+let authStatePromise: Promise<AuthState> | null = null;
+function getAuthState(): Promise<AuthState> {
+  if (!authStatePromise) {
+    authStatePromise = ensureAuthenticated().catch((err) => {
+      // Don't cache a failed login forever -- clear it so the next call (e.g.
+      // triggered by the user retrying the tool) starts a fresh attempt
+      // instead of replaying the same rejection until the process restarts.
+      authStatePromise = null;
+      throw err;
+    });
+  }
+  return authStatePromise;
 }
 
 // Directories `display_pdf` is allowed to open from. Configured via the mcpb
@@ -148,13 +160,23 @@ async function downloadPdfFromUrl(pdfUrl: string): Promise<{ tempPath: string; n
 const DEFAULT_PORT = Number(process.env.PWV_PORT ?? 41973);
 
 // Secret gating the /xhrmod outbound relay; injected into the UI resource HTML
-// so only our iframe can use it. Derived from the license key so it stays
-// stable across process restarts -- Claude Desktop caches the resource HTML and
-// a random token would break the relay after every restart until cache clears.
-const PROXY_TOKEN = createHash('sha256')
-  .update('pwv-proxy-' + (LICENSE_KEY || 'no-license'))
-  .digest('hex')
-  .slice(0, 32);
+// so only our iframe can use it. Must stay stable across process restarts --
+// Claude Desktop caches the resource HTML and a token that changes on every
+// restart would break the relay until the cache clears. Previously derived
+// from the (synchronous, static) license key; now that the license comes from
+// an async login, it's persisted to its own small file instead.
+const PROXY_SECRET_FILE = path.join(os.homedir(), '.avanquest-pdf-mcp', 'proxy-secret');
+let PROXY_TOKEN = '';
+async function loadOrCreateProxyToken(): Promise<string> {
+  try {
+    const existing = (await fs.readFile(PROXY_SECRET_FILE, 'utf-8')).trim();
+    if (existing) return existing;
+  } catch { /* not created yet */ }
+  const fresh = randomUUID().replace(/-/g, '') + randomUUID().replace(/-/g, '');
+  await fs.mkdir(path.dirname(PROXY_SECRET_FILE), { recursive: true });
+  await fs.writeFile(PROXY_SECRET_FILE, fresh, 'utf-8');
+  return fresh;
+}
 
 // The relay exists solely so the viewer's WASM can validate its license.
 // Restrict it to that host so it can't be used as a general localhost proxy.
@@ -375,7 +397,53 @@ function renderStub(stub: string, baseUrl: string, license: string): string {
 }
 
 
+// Populated once getAuthState() resolves/rejects, so tool handlers can check
+// readiness synchronously instead of blocking on a potentially multi-minute
+// browser login. kickOffAuth() re-attaches itself on failure so the next
+// checkAuthReady() call (i.e. the user retrying the tool) starts a fresh
+// login attempt rather than replaying a stale error forever.
+let resolvedAuth: AuthState | null = null;
+let authError: Error | null = null;
+let authAttemptPending = false;
+
+function kickOffAuth(): void {
+  if (authAttemptPending) return;
+  authAttemptPending = true;
+  console.error('[avanquest-pdf] starting sign-in check...');
+  getAuthState().then(
+    (state) => {
+      authAttemptPending = false;
+      resolvedAuth = state;
+      authError = null;
+      console.error(`[avanquest-pdf] signed in${state.profile?.email ? ' as ' + state.profile.email : ''}`);
+    },
+    (err) => {
+      authAttemptPending = false;
+      authError = err as Error;
+      console.error(`[avanquest-pdf] sign-in failed: ${(err as Error).stack ?? (err as Error).message}`);
+    },
+  );
+}
+
+function checkAuthReady(): { ready: true; license: string } | { ready: false; message: string } {
+  if (resolvedAuth) return { ready: true, license: resolvedAuth.licenseKey };
+  if (authError) {
+    const message = `Sign-in failed: ${authError.message}. Retrying -- please try the command again in a moment, or check the server logs.`;
+    kickOffAuth();
+    return { ready: false, message };
+  }
+  return {
+    ready: false,
+    message: 'Please check the browser tab that just opened and sign in with your Avanquest account, then try again.',
+  };
+}
+
 async function main(): Promise<void> {
+  PROXY_TOKEN = await loadOrCreateProxyToken();
+  // Kicked off in the background (not awaited) so a pending browser login
+  // never delays the MCP initialize handshake with Claude Desktop.
+  kickOffAuth();
+
   const { baseUrl } = await startAssetServer();
   const stubTemplate = await fs.readFile(STUB_HTML_PATH, 'utf-8');
 
@@ -410,6 +478,11 @@ async function main(): Promise<void> {
       _meta: { ui: { resourceUri } },
     },
     async ({ path: requestedPath, url: pdfUrl }) => {
+      const auth = checkAuthReady();
+      if (!auth.ready) {
+        return { content: [{ type: 'text', text: auth.message }], isError: true };
+      }
+
       if (!requestedPath && !pdfUrl) {
         return {
           content: [{ type: 'text', text: 'Provide either path (local file) or url (remote PDF).' }],
@@ -2247,7 +2320,7 @@ async function main(): Promise<void> {
             {
               uri: diagResourceUri,
               mimeType: RESOURCE_MIME_TYPE,
-              text: renderStub(diagTemplate, baseUrl, LICENSE_KEY),
+              text: renderStub(diagTemplate, baseUrl, (await getAuthState()).licenseKey),
               _meta: { ui: { csp: { resourceDomains: [baseUrl], connectDomains: [baseUrl] } } },
             },
           ],
@@ -2276,7 +2349,7 @@ async function main(): Promise<void> {
         {
           uri: resourceUri,
           mimeType: RESOURCE_MIME_TYPE,
-          text: renderStub(stubTemplate, baseUrl, LICENSE_KEY),
+          text: renderStub(stubTemplate, baseUrl, (await getAuthState()).licenseKey),
           _meta: {
             ui: {
               csp: {

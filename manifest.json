@@ -2,7 +2,7 @@
   "manifest_version": "0.4",
   "name": "avanquest-pdf-mcp-editor",
   "display_name": "Avanquest PDF Viewer",
-  "version": "0.4.154",
+  "version": "0.4.160",
   "description": "View PDF files inside Claude Desktop using the Avanquest PDF web viewer.",
   "long_description": "Provides a display_pdf tool that opens a local PDF file in an interactive viewer rendered inline in the Claude Desktop chat. Powered by @avanquest/pdf-web-viewer.",
   "author": {
@@ -39,19 +39,11 @@
         "${__dirname}/dist/server.js"
       ],
       "env": {
-        "PWV_LICENSE_KEY": "${user_config.license_key}",
         "PWV_ALLOWED_DIRS_LIST": "${user_config.allowed_dir_1}"
       }
     }
   },
   "user_config": {
-    "license_key": {
-      "type": "string",
-      "title": "Avanquest PDF license key",
-      "description": "Your @avanquest/pdf-web-viewer license key. Required to render PDFs.",
-      "sensitive": true,
-      "required": true
-    },
     "allowed_dir_1": {
       "type": "directory",
       "title": "Default folder",
