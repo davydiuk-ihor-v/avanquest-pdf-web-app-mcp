@@ -407,6 +407,16 @@ async function main(): Promise<void> {
         path: z.string().optional().describe("Absolute path to a PDF file within the user's allowed document folders"),
         url: z.string().optional().describe('URL of a remote PDF to download and open (http or https)'),
       },
+      // outputSchema is REQUIRED for the host to forward structuredContent to the
+      // app iframe. Newer Claude Desktop strips structuredContent from the
+      // tool-result notification when a tool declares none, which left the viewer
+      // blank (openPdf never received url/token). See ontoolresult in mcp-app.ts.
+      outputSchema: {
+        url: z.string(),
+        name: z.string(),
+        token: z.string(),
+        filePath: z.string(),
+      },
       _meta: { ui: { resourceUri } },
     },
     async ({ path: requestedPath, url: pdfUrl }) => {
@@ -451,9 +461,11 @@ async function main(): Promise<void> {
       _pendingDocOpen = true;
       pendingViewerCommand = null;
 
+      const structured = { url: fileUrl, name, token, filePath: pdfUrl ?? absolutePath };
+      pendingOpenTarget = structured;
       return {
         content: [{ type: 'text', text: `Opened ${name} in the viewer.` }],
-        structuredContent: { url: fileUrl, name, token, filePath: pdfUrl ?? absolutePath },
+        structuredContent: structured,
       };
     },
   );
@@ -554,6 +566,13 @@ async function main(): Promise<void> {
           .describe('Compression level: max=maximum compression (smallest file, lower quality), min=minimum compression (largest file, best quality). Default: medium'),
         outputPath: z.string().optional().describe('Where to save the compressed file. Defaults to original filename with _compressed suffix'),
       },
+      outputSchema: {
+        url: z.string(),
+        name: z.string(),
+        token: z.string(),
+        filePath: z.string(),
+        command: z.record(z.string(), z.unknown()).optional(),
+      },
       _meta: { ui: { resourceUri } },
     },
     async ({ path: requestedPath, compression, outputPath }) => {
@@ -566,15 +585,17 @@ async function main(): Promise<void> {
       const savePath = outputPath?.trim() || filePath.slice(0, -ext.length) + '_compressed' + ext;
       const name = path.basename(filePath);
       const token = mintToken(filePath, name);
+      const structured = {
+        url: `${baseUrl}/file/${token}`,
+        name,
+        token,
+        filePath,
+        command: { type: 'compress_pdf', compression: compression ?? 'medium', outputPath: savePath },
+      };
+      pendingOpenTarget = structured;
       return {
         content: [{ type: 'text', text: `Opening ${name} for compression (compression: ${compression ?? 'medium'})...` }],
-        structuredContent: {
-          url: `${baseUrl}/file/${token}`,
-          name,
-          token,
-          filePath,
-          command: { type: 'compress_pdf', compression: compression ?? 'medium', outputPath: savePath },
-        },
+        structuredContent: structured,
       };
     },
   );
@@ -589,6 +610,13 @@ async function main(): Promise<void> {
       inputSchema: {
         paths: z.array(z.string()).min(2).describe('Absolute paths to PDF files to merge, in order'),
         outputPath: z.string().optional().describe('Where to save the merged file. Defaults to <firstName>_merged.pdf next to the first file'),
+      },
+      outputSchema: {
+        url: z.string(),
+        name: z.string(),
+        token: z.string(),
+        filePath: z.string(),
+        command: z.record(z.string(), z.unknown()).optional(),
       },
       _meta: { ui: { resourceUri } },
     },
@@ -607,15 +635,17 @@ async function main(): Promise<void> {
         const name = path.basename(fp);
         return { token: mintToken(fp, name), name };
       });
+      const structured = {
+        url: `${baseUrl}/file/${files[0].token}`,
+        name: files[0].name,
+        token: files[0].token,
+        filePath: firstPath,
+        command: { type: 'merge_pdf', files, outputPath: savePath },
+      };
+      pendingOpenTarget = structured;
       return {
         content: [{ type: 'text', text: `Opening ${files[0].name} for merge (${paths.length} files)...` }],
-        structuredContent: {
-          url: `${baseUrl}/file/${files[0].token}`,
-          name: files[0].name,
-          token: files[0].token,
-          filePath: firstPath,
-          command: { type: 'merge_pdf', files, outputPath: savePath },
-        },
+        structuredContent: structured,
       };
     },
   );
@@ -633,6 +663,13 @@ async function main(): Promise<void> {
         pagesPerFile: z.number().int().min(1).optional().describe('Split into equal chunks of N pages each. Alternative to ranges.'),
         outputDir: z.string().optional().describe('Directory for output files. Defaults to same directory as the input file.'),
       },
+      outputSchema: {
+        url: z.string(),
+        name: z.string(),
+        token: z.string(),
+        filePath: z.string(),
+        command: z.record(z.string(), z.unknown()).optional(),
+      },
       _meta: { ui: { resourceUri } },
     },
     async ({ path: requestedPath, ranges, pagesPerFile, outputDir }) => {
@@ -647,15 +684,17 @@ async function main(): Promise<void> {
       const outDir = outputDir?.trim() || path.dirname(filePath);
       const name = path.basename(filePath);
       const token = mintToken(filePath, name);
+      const structured = {
+        url: `${baseUrl}/file/${token}`,
+        name,
+        token,
+        filePath,
+        command: { type: 'split_pdf', ranges, pagesPerFile, outputDir: outDir, baseName },
+      };
+      pendingOpenTarget = structured;
       return {
         content: [{ type: 'text', text: `Opening ${name} for split...` }],
-        structuredContent: {
-          url: `${baseUrl}/file/${token}`,
-          name,
-          token,
-          filePath,
-          command: { type: 'split_pdf', ranges, pagesPerFile, outputDir: outDir, baseName },
-        },
+        structuredContent: structured,
       };
     },
   );
@@ -664,6 +703,15 @@ async function main(): Promise<void> {
   let pendingSearchResult: { count: number; pages: number[] } | null = null;
   let pendingViewerResult: { type: string; data: unknown } | null = null;
   let _pendingDocOpen = false;
+
+  // Last PDF open target (url/token/name/command) set by display_pdf/compress/merge/
+  // split. The app fetches this via the get_pending_open tool because some hosts
+  // (Claude Desktop <=1.20186) declare no structuredContent capability and strip
+  // structuredContent from the tool-result notification, so the app never receives
+  // the token/url that way. The app->server callServerTool channel is NOT stripped.
+  let pendingOpenTarget:
+    | { url: string; name: string; token: string; filePath: string; command?: Record<string, unknown> }
+    | null = null;
 
   // Tracks last-known document state injected by mcp-app.ts via report_viewer_result.
   // Appended to every viewer tool response so Claude always knows pageCount after each op.
@@ -2149,6 +2197,22 @@ async function main(): Promise<void> {
           return ok('Page numbers inserted successfully.');
         },
       );
+    },
+  );
+
+  registerAppTool(
+    server,
+    'get_pending_open',
+    {
+      title: 'Get Pending Open',
+      annotations: { readOnlyHint: true },
+      description: 'Internal: return the last PDF open target (url/token/name/command) for the app iframe. Fallback for hosts that strip structuredContent from tool-result notifications.',
+      _meta: { ui: { resourceUri, visibility: ['app'] as const } },
+    },
+    async () => {
+      return {
+        content: [{ type: 'text' as const, text: JSON.stringify({ open: pendingOpenTarget }) }],
+      };
     },
   );
 

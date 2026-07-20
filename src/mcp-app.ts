@@ -3229,10 +3229,23 @@ type ToolCommand = {
   baseName?: string;
 };
 
-app.ontoolresult = (result) => {
-  const data = (result as {
+app.ontoolresult = async (result) => {
+  let data = (result as {
     structuredContent?: { token?: string; name?: string; filePath?: string; command?: ToolCommand };
   }).structuredContent;
+  // Some hosts (e.g. Claude Desktop 1.20186, which declares no structuredContent
+  // capability) strip structuredContent from the tool-result notification, so
+  // `data` is undefined even on success. Recover the open target over the
+  // app->server callServerTool channel, which is NOT stripped.
+  if (!(data?.token && data.name)) {
+    try {
+      const r = await (app as any).callServerTool({ name: 'get_pending_open', arguments: {} });
+      const parsed = JSON.parse((r.content?.[0] as { text?: string })?.text ?? '{}') as {
+        open?: { token?: string; name?: string; filePath?: string; command?: ToolCommand };
+      };
+      if (parsed.open?.token && parsed.open?.name) data = parsed.open;
+    } catch { /* leave data as-is; open is skipped below if still empty */ }
+  }
   if (data?.token && data.name) {
     _currentToken = data.token;
     _currentFilePath = data.filePath ?? '';
