@@ -1,0 +1,50 @@
+name: Build MCPB
+
+permissions:
+  contents: write
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  release:
+    types: [published]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      # This repo does NOT use `mcpb pack .` — that drags ~95MB of dev tooling
+      # into the bundle. scripts/pack-mcpb.mjs stages dist/ + manifest.json +
+      # icon.png + LICENSE with a production-only node_modules, then packs that.
+      - name: Pack MCPB
+        run: |
+          npm install -g @anthropic-ai/mcpb@2.1.2
+          node scripts/pack-mcpb.mjs avanquest-pdf-mcp-editor.mcpb
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: avanquest-pdf-mcp-editor
+          path: avanquest-pdf-mcp-editor.mcpb
+
+      - name: Attach to release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ github.event.release.tag_name }}" avanquest-pdf-mcp-editor.mcpb
