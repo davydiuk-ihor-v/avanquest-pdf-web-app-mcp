@@ -3229,6 +3229,27 @@ type ToolCommand = {
   baseName?: string;
 };
 
+// ── Fullscreen arbitration across sibling widget iframes ────────────────────
+// A widget's iframe re-fires `ontoolresult` on every remount — not just on a
+// genuinely new tool call, but also when scrolling it back into view, or when
+// reopening a past chat much later. Each widget also runs on its own ephemeral
+// sandbox origin (a random per-instance claudemcpcontent.com subdomain), so
+// BroadcastChannel/localStorage cannot coordinate between them even for
+// concurrent opens. The one thing every widget in a conversation actually
+// shares is the local Node MCP server process, so arbitration happens there
+// via the claim_fullscreen tool, keyed on the document's token: the first
+// widget to claim a given token gets fullscreen; any later claim for that
+// same token (a remount) is denied and stays inline with its manual expand
+// button.
+function shouldAutoFullscreen(token: string): Promise<boolean> {
+  return (app as any).callServerTool({ name: 'claim_fullscreen', arguments: { token } })
+    .then((r: { content?: Array<{ text?: string }> }) => {
+      const parsed = JSON.parse(r.content?.[0]?.text ?? '{}') as { allow?: boolean };
+      return parsed.allow ?? true;
+    })
+    .catch(() => true);
+}
+
 app.ontoolresult = async (result) => {
   let data = (result as {
     structuredContent?: { token?: string; name?: string; filePath?: string; command?: ToolCommand };
@@ -3247,12 +3268,15 @@ app.ontoolresult = async (result) => {
     } catch { /* leave data as-is; open is skipped below if still empty */ }
   }
   if (data?.token && data.name) {
+    const token = data.token;
     _currentToken = data.token;
     _currentFilePath = data.filePath ?? '';
     _openingDocument = openPdf(data.token, data.name, data.filePath).then(async () => {
       try {
-        const r = await (app as any).requestDisplayMode({ mode: 'fullscreen' });
-        updateFullscreenBtn(r?.mode ?? 'fullscreen');
+        if (await shouldAutoFullscreen(token)) {
+          const r = await (app as any).requestDisplayMode({ mode: 'fullscreen' });
+          updateFullscreenBtn(r?.mode ?? 'fullscreen');
+        }
       } catch (_) {}
       if (data.command?.type === 'compress_pdf') {
         await handleCompress(data.command.compression ?? 'medium', data.command.outputPath ?? _currentFilePath);

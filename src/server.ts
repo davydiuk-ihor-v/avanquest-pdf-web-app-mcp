@@ -718,6 +718,19 @@ async function main(): Promise<void> {
   let _lastDocState = '';
   function docNote(): string { return _lastDocState ? ` [${_lastDocState}]` : ''; }
 
+  // Fullscreen arbitration across sibling widget iframes. Each display_pdf/etc.
+  // widget renders in its own iframe on its own ephemeral sandbox origin, so
+  // BroadcastChannel/localStorage cannot coordinate between them — this server
+  // process is the only thing all widgets in a conversation actually share.
+  // A widget's iframe re-fires ontoolresult on every remount, not just on a
+  // genuinely new tool call — scrolling it back into view or reopening a past
+  // chat much later remounts it the same way, at an arbitrary later time. So
+  // arbitration is keyed on the document's token rather than on timing: the
+  // first widget to claim a given token gets fullscreen; every later claim for
+  // that same token (any remount) is denied and stays inline with its manual
+  // expand button.
+  const fullscreenGrantedTokens = new Set<string>();
+
   type TR = { content: [{ type: 'text'; text: string }]; isError?: true };
   const ok  = (text: string): TR => ({ content: [{ type: 'text' as const, text }] });
   const nok = (text: string): TR => ({ content: [{ type: 'text' as const, text }], isError: true });
@@ -2212,6 +2225,26 @@ async function main(): Promise<void> {
     async () => {
       return {
         content: [{ type: 'text' as const, text: JSON.stringify({ open: pendingOpenTarget }) }],
+      };
+    },
+  );
+
+  registerAppTool(
+    server,
+    'claim_fullscreen',
+    {
+      title: 'Claim Fullscreen',
+      annotations: { readOnlyHint: false, destructiveHint: false },
+      description: 'Internal: arbitrate whether a widget iframe is allowed to auto-enter fullscreen. Grants once per document token; later claims for the same token (a remount from scrolling or reopening the chat) are denied.',
+      inputSchema: { token: z.string().optional() },
+      _meta: { ui: { resourceUri, visibility: ['app'] as const } },
+    },
+    async ({ token }) => {
+      const key = token ?? '';
+      const allow = !fullscreenGrantedTokens.has(key);
+      fullscreenGrantedTokens.add(key);
+      return {
+        content: [{ type: 'text' as const, text: JSON.stringify({ allow }) }],
       };
     },
   );
