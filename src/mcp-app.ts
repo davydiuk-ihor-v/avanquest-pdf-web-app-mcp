@@ -494,6 +494,12 @@ let _searchDocumentView: any = null;
 // After page rotation the host may re-fire hostcontextchanged with smaller dims
 // (landscape page is shorter); we ignore those shrinks while in fullscreen.
 let _lockedFullscreenH = 0;
+// hostcontextchanged fires more than once per transition, and later firings
+// often omit safeAreaInsets entirely (ctx.safeAreaInsets === undefined) even
+// though an earlier firing in the very same transition had real values. Cache
+// the last known insets so a later insets-less event doesn't reset our
+// applied height back to the full (unsafe) container size.
+let _lastKnownSafeAreaInsets: { top?: number; right?: number; bottom?: number; left?: number } | null = null;
 
 function updateFullscreenBtn(mode: string) {
   _currentMode = mode;
@@ -510,6 +516,14 @@ fullscreenBtn.addEventListener('click', async () => {
     updateFullscreenBtn(result?.mode ?? next);
   } catch (_) {}
 });
+
+let _lastFullH = 0;
+// Whether the vendor viewer currently has one of its own modal dialogs open
+// (detected heuristically below — see detectModalOpen). We only reserve the
+// safe-area space (and make body a containing block for fixed descendants)
+// while a modal is actually showing; the rest of the time we use the full
+// height, so no permanent blank strip is left at the bottom of the widget.
+let _modalOpen = false;
 
 function applyContainerHeight(ctx: any) {
   const ctxMode = ctx?.displayMode;
@@ -534,10 +548,105 @@ function applyContainerHeight(ctx: any) {
   } else {
     h = Math.round(window.screen.availHeight * 0.70);
   }
+  if (ctx?.safeAreaInsets) _lastKnownSafeAreaInsets = ctx.safeAreaInsets;
+  _lastFullH = h;
+  applyHeightForModalState();
+}
+
+// Host UI (e.g. the floating chat input box) can float over the top/bottom
+// edge of our iframe without our content knowing — safeAreaInsets tells us
+// how much of each edge to leave clear. `position: fixed` elements (like the
+// vendor viewer's own modal dialogs) always measure themselves against the
+// true browser viewport regardless of any height we set on html/body, so we
+// only shrink our applied height — and make body the containing block for
+// fixed descendants via `transform`, per the CSS spec — WHILE a modal is
+// actually open. The rest of the time we use the real full height so no
+// permanent blank strip appears.
+function applyHeightForModalState(): void {
+  const insets = _lastKnownSafeAreaInsets;
+  let h = _lastFullH;
+  const reserveSafeArea = _modalOpen && !!insets;
+  if (reserveSafeArea && insets) {
+    const top = typeof insets.top === 'number' ? insets.top : 0;
+    const bottom = typeof insets.bottom === 'number' ? insets.bottom : 0;
+    h = Math.max(0, h - top - bottom);
+  }
   document.documentElement.style.height = `${h}px`;
   document.body.style.height = `${h}px`;
   viewerEl.style.height = `${h}px`;
+  document.body.style.transform = reserveSafeArea ? 'translateZ(0)' : '';
+  // The area we just carved out (window.innerHeight - h) isn't part of any
+  // element's box anymore, but the browser still paints the root element's
+  // background across the whole canvas/viewport regardless of its own box
+  // height — so colouring <html> to match the dialog's own dimmed backdrop
+  // makes that reserved strip blend in instead of showing as a stark white
+  // gap. Reset to the page's normal (transparent) background otherwise.
+  document.documentElement.style.background = reserveSafeArea ? 'rgba(0, 0, 0, 0.5)' : '';
 }
+
+// The vendor viewer mounts as web components (custom elements like
+// <document-viewer-wrapper>) with Shadow DOM, so a plain
+// document.body.getElementsByTagName('*') traversal never reaches its modal
+// dialogs — they live inside a shadowRoot. Walk both light and shadow trees.
+function collectAllElements(root: Element | ShadowRoot, out: Element[]): void {
+  const kids = root.children;
+  for (let i = 0; i < kids.length; i++) {
+    const el = kids[i];
+    out.push(el);
+    if (el.shadowRoot) collectAllElements(el.shadowRoot, out);
+    collectAllElements(el, out);
+  }
+}
+
+// Heuristic modal detector: we have no documented open/close API from the
+// vendor viewer, so watch for a `position: fixed`/`absolute` descendant large
+// enough to be a dialog backdrop (its own modals cover most of the viewport)
+// appearing or disappearing, and toggle the safe-area reservation accordingly.
+function detectModalOpen(): boolean {
+  const minW = window.innerWidth * 0.5;
+  const minH = window.innerHeight * 0.5;
+  const all: Element[] = [];
+  collectAllElements(document.body, all);
+  for (const el of all) {
+    if (el === viewerEl || el === statusEl || el === fullscreenBtn) continue;
+    const rect = el.getBoundingClientRect();
+    if (rect.width < minW || rect.height < minH) continue;
+    const pos = window.getComputedStyle(el).position;
+    if (pos === 'fixed' || pos === 'absolute') return true;
+  }
+  return false;
+}
+
+let _modalCheckScheduled = false;
+function scheduleModalCheck(): void {
+  if (_modalCheckScheduled) return;
+  _modalCheckScheduled = true;
+  requestAnimationFrame(() => {
+    _modalCheckScheduled = false;
+    const open = detectModalOpen();
+    if (open !== _modalOpen) {
+      _modalOpen = open;
+      applyHeightForModalState();
+    }
+  });
+}
+
+new MutationObserver(scheduleModalCheck).observe(document.body, {
+  childList: true,
+  subtree: true,
+  attributes: true,
+  attributeFilter: ['style', 'class'],
+});
+// MutationObserver does not cross shadow DOM boundaries, and the vendor
+// viewer's modals live inside a shadowRoot, so opening/closing one may never
+// produce a mutation this observer can see. Poll as a reliable fallback —
+// cheap enough at this interval for a bounded DOM+shadow-DOM walk.
+setInterval(scheduleModalCheck, 120);
+// Re-check right after any click (capture phase, so it still fires even if
+// the vendor's own Cancel/Apply/close handler stops propagation) — closing a
+// dialog is almost always a click, and reacting to it directly feels far
+// snappier than waiting for the next poll tick.
+document.addEventListener('pointerup', scheduleModalCheck, true);
 
 app.addEventListener('hostcontextchanged', (ctx: any) => {
   applyContainerHeight(ctx);
@@ -3229,30 +3338,72 @@ type ToolCommand = {
   baseName?: string;
 };
 
+// ── Fullscreen arbitration across sibling widget iframes ────────────────────
+// A widget's iframe re-fires `ontoolresult` on every remount — not just on a
+// genuinely new tool call, but also when scrolling it back into view, or when
+// reopening a past chat much later. Each widget also runs on its own ephemeral
+// sandbox origin (a random per-instance claudemcpcontent.com subdomain), so
+// BroadcastChannel/localStorage cannot coordinate between them even for
+// concurrent opens. The one thing every widget in a conversation actually
+// shares is the local Node MCP server process, so arbitration happens there
+// via the claim_fullscreen tool, keyed on the document's token: the first
+// widget to claim a given token gets fullscreen; any later claim for that
+// same token (a remount) is denied and stays inline with its manual expand
+// button.
+function shouldAutoFullscreen(token: string): Promise<boolean> {
+  return (app as any).callServerTool({ name: 'claim_fullscreen', arguments: { token } })
+    .then((r: { content?: Array<{ text?: string }> }) => {
+      const parsed = JSON.parse(r.content?.[0]?.text ?? '{}') as { allow?: boolean };
+      return parsed.allow ?? true;
+    })
+    .catch(() => true);
+}
+
+type OpenTarget = { token?: string; name?: string; filePath?: string; command?: ToolCommand };
+
+// Every observed host strips `structuredContent` from `ontoolresult` (confirmed
+// via debug logging: absent on every firing, live open or historical replay).
+// `get_pending_open`'s fallback returns a single server-process-wide "last
+// opened" pointer, which is wrong for a remounted widget once some OTHER
+// conversation has opened a different document since. The tool's own `content`
+// array reliably differs per call and is not affected by whatever strips
+// structuredContent, so the server also embeds the open target there (see
+// `openTargetContentBlock` in src/server.ts) — check that first.
+function parseOpenTargetFromContent(result: { content?: Array<{ text?: string }> }): OpenTarget | undefined {
+  for (const block of result.content ?? []) {
+    if (!block.text) continue;
+    try {
+      const parsed = JSON.parse(block.text) as { open?: OpenTarget };
+      if (parsed.open?.token && parsed.open?.name) return parsed.open;
+    } catch { /* not our JSON block, keep looking */ }
+  }
+  return undefined;
+}
+
 app.ontoolresult = async (result) => {
-  let data = (result as {
-    structuredContent?: { token?: string; name?: string; filePath?: string; command?: ToolCommand };
-  }).structuredContent;
-  // Some hosts (e.g. Claude Desktop 1.20186, which declares no structuredContent
-  // capability) strip structuredContent from the tool-result notification, so
-  // `data` is undefined even on success. Recover the open target over the
-  // app->server callServerTool channel, which is NOT stripped.
+  let data = (result as { structuredContent?: OpenTarget }).structuredContent;
+  if (!(data?.token && data.name)) {
+    data = parseOpenTargetFromContent(result as { content?: Array<{ text?: string }> });
+  }
+  // Last-resort fallback for hosts where neither of the above arrives (e.g. very
+  // old cached widget builds): ask the server for the last-known open target.
   if (!(data?.token && data.name)) {
     try {
       const r = await (app as any).callServerTool({ name: 'get_pending_open', arguments: {} });
-      const parsed = JSON.parse((r.content?.[0] as { text?: string })?.text ?? '{}') as {
-        open?: { token?: string; name?: string; filePath?: string; command?: ToolCommand };
-      };
+      const parsed = JSON.parse((r.content?.[0] as { text?: string })?.text ?? '{}') as { open?: OpenTarget };
       if (parsed.open?.token && parsed.open?.name) data = parsed.open;
     } catch { /* leave data as-is; open is skipped below if still empty */ }
   }
   if (data?.token && data.name) {
+    const token = data.token;
     _currentToken = data.token;
     _currentFilePath = data.filePath ?? '';
     _openingDocument = openPdf(data.token, data.name, data.filePath).then(async () => {
       try {
-        const r = await (app as any).requestDisplayMode({ mode: 'fullscreen' });
-        updateFullscreenBtn(r?.mode ?? 'fullscreen');
+        if (await shouldAutoFullscreen(token)) {
+          const r = await (app as any).requestDisplayMode({ mode: 'fullscreen' });
+          updateFullscreenBtn(r?.mode ?? 'fullscreen');
+        }
       } catch (_) {}
       if (data.command?.type === 'compress_pdf') {
         await handleCompress(data.command.compression ?? 'medium', data.command.outputPath ?? _currentFilePath);
