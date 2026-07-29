@@ -494,6 +494,12 @@ let _searchDocumentView: any = null;
 // After page rotation the host may re-fire hostcontextchanged with smaller dims
 // (landscape page is shorter); we ignore those shrinks while in fullscreen.
 let _lockedFullscreenH = 0;
+// hostcontextchanged fires more than once per transition, and later firings
+// often omit safeAreaInsets entirely (ctx.safeAreaInsets === undefined) even
+// though an earlier firing in the very same transition had real values. Cache
+// the last known insets so a later insets-less event doesn't reset our
+// applied height back to the full (unsafe) container size.
+let _lastKnownSafeAreaInsets: { top?: number; right?: number; bottom?: number; left?: number } | null = null;
 
 function updateFullscreenBtn(mode: string) {
   _currentMode = mode;
@@ -510,6 +516,14 @@ fullscreenBtn.addEventListener('click', async () => {
     updateFullscreenBtn(result?.mode ?? next);
   } catch (_) {}
 });
+
+let _lastFullH = 0;
+// Whether the vendor viewer currently has one of its own modal dialogs open
+// (detected heuristically below — see detectModalOpen). We only reserve the
+// safe-area space (and make body a containing block for fixed descendants)
+// while a modal is actually showing; the rest of the time we use the full
+// height, so no permanent blank strip is left at the bottom of the widget.
+let _modalOpen = false;
 
 function applyContainerHeight(ctx: any) {
   const ctxMode = ctx?.displayMode;
@@ -534,10 +548,105 @@ function applyContainerHeight(ctx: any) {
   } else {
     h = Math.round(window.screen.availHeight * 0.70);
   }
+  if (ctx?.safeAreaInsets) _lastKnownSafeAreaInsets = ctx.safeAreaInsets;
+  _lastFullH = h;
+  applyHeightForModalState();
+}
+
+// Host UI (e.g. the floating chat input box) can float over the top/bottom
+// edge of our iframe without our content knowing — safeAreaInsets tells us
+// how much of each edge to leave clear. `position: fixed` elements (like the
+// vendor viewer's own modal dialogs) always measure themselves against the
+// true browser viewport regardless of any height we set on html/body, so we
+// only shrink our applied height — and make body the containing block for
+// fixed descendants via `transform`, per the CSS spec — WHILE a modal is
+// actually open. The rest of the time we use the real full height so no
+// permanent blank strip appears.
+function applyHeightForModalState(): void {
+  const insets = _lastKnownSafeAreaInsets;
+  let h = _lastFullH;
+  const reserveSafeArea = _modalOpen && !!insets;
+  if (reserveSafeArea && insets) {
+    const top = typeof insets.top === 'number' ? insets.top : 0;
+    const bottom = typeof insets.bottom === 'number' ? insets.bottom : 0;
+    h = Math.max(0, h - top - bottom);
+  }
   document.documentElement.style.height = `${h}px`;
   document.body.style.height = `${h}px`;
   viewerEl.style.height = `${h}px`;
+  document.body.style.transform = reserveSafeArea ? 'translateZ(0)' : '';
+  // The area we just carved out (window.innerHeight - h) isn't part of any
+  // element's box anymore, but the browser still paints the root element's
+  // background across the whole canvas/viewport regardless of its own box
+  // height — so colouring <html> to match the dialog's own dimmed backdrop
+  // makes that reserved strip blend in instead of showing as a stark white
+  // gap. Reset to the page's normal (transparent) background otherwise.
+  document.documentElement.style.background = reserveSafeArea ? 'rgba(0, 0, 0, 0.5)' : '';
 }
+
+// The vendor viewer mounts as web components (custom elements like
+// <document-viewer-wrapper>) with Shadow DOM, so a plain
+// document.body.getElementsByTagName('*') traversal never reaches its modal
+// dialogs — they live inside a shadowRoot. Walk both light and shadow trees.
+function collectAllElements(root: Element | ShadowRoot, out: Element[]): void {
+  const kids = root.children;
+  for (let i = 0; i < kids.length; i++) {
+    const el = kids[i];
+    out.push(el);
+    if (el.shadowRoot) collectAllElements(el.shadowRoot, out);
+    collectAllElements(el, out);
+  }
+}
+
+// Heuristic modal detector: we have no documented open/close API from the
+// vendor viewer, so watch for a `position: fixed`/`absolute` descendant large
+// enough to be a dialog backdrop (its own modals cover most of the viewport)
+// appearing or disappearing, and toggle the safe-area reservation accordingly.
+function detectModalOpen(): boolean {
+  const minW = window.innerWidth * 0.5;
+  const minH = window.innerHeight * 0.5;
+  const all: Element[] = [];
+  collectAllElements(document.body, all);
+  for (const el of all) {
+    if (el === viewerEl || el === statusEl || el === fullscreenBtn) continue;
+    const rect = el.getBoundingClientRect();
+    if (rect.width < minW || rect.height < minH) continue;
+    const pos = window.getComputedStyle(el).position;
+    if (pos === 'fixed' || pos === 'absolute') return true;
+  }
+  return false;
+}
+
+let _modalCheckScheduled = false;
+function scheduleModalCheck(): void {
+  if (_modalCheckScheduled) return;
+  _modalCheckScheduled = true;
+  requestAnimationFrame(() => {
+    _modalCheckScheduled = false;
+    const open = detectModalOpen();
+    if (open !== _modalOpen) {
+      _modalOpen = open;
+      applyHeightForModalState();
+    }
+  });
+}
+
+new MutationObserver(scheduleModalCheck).observe(document.body, {
+  childList: true,
+  subtree: true,
+  attributes: true,
+  attributeFilter: ['style', 'class'],
+});
+// MutationObserver does not cross shadow DOM boundaries, and the vendor
+// viewer's modals live inside a shadowRoot, so opening/closing one may never
+// produce a mutation this observer can see. Poll as a reliable fallback —
+// cheap enough at this interval for a bounded DOM+shadow-DOM walk.
+setInterval(scheduleModalCheck, 120);
+// Re-check right after any click (capture phase, so it still fires even if
+// the vendor's own Cancel/Apply/close handler stops propagation) — closing a
+// dialog is almost always a click, and reacting to it directly feels far
+// snappier than waiting for the next poll tick.
+document.addEventListener('pointerup', scheduleModalCheck, true);
 
 app.addEventListener('hostcontextchanged', (ctx: any) => {
   applyContainerHeight(ctx);
