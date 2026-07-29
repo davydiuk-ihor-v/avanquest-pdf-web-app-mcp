@@ -395,6 +395,26 @@ async function main(): Promise<void> {
   const resourceUri = `ui://avanquest-pdf-viewer/mcp-app-v${vSlug}.html`;
   const diagResourceUri = `ui://avanquest-pdf-viewer/diag-v${vSlug}.html`;
 
+  // Every host we've observed strips `structuredContent` from the tool-result
+  // notification the widget iframe receives on `ontoolresult` (confirmed via
+  // debug logging: structuredContent is always absent, even on a fresh live
+  // open). Without it, the widget fell back to `get_pending_open`, a single
+  // server-process-wide "last opened" pointer — which is wrong for a widget
+  // being remounted later (scrolled back into view, or a past chat reopened),
+  // since some OTHER conversation may have opened a different document since.
+  // The one channel that reliably survives to the widget, unique per call, is
+  // the tool result's own `content` array — so we carry the open target there
+  // too, as a second content block marked `audience: ['user']` (not meant for
+  // the model to read/repeat). `structuredContent`/`get_pending_open` remain
+  // as fallbacks for hosts where this new block might not arrive either.
+  function openTargetContentBlock(structured: Record<string, unknown>): { type: 'text'; text: string; annotations: { audience: ['user'] } } {
+    return {
+      type: 'text' as const,
+      text: JSON.stringify({ open: structured }),
+      annotations: { audience: ['user'] },
+    };
+  }
+
   registerAppTool(
     server,
     'display_pdf',
@@ -464,7 +484,10 @@ async function main(): Promise<void> {
       const structured = { url: fileUrl, name, token, filePath: pdfUrl ?? absolutePath };
       pendingOpenTarget = structured;
       return {
-        content: [{ type: 'text', text: `Opened ${name} in the viewer.` }],
+        content: [
+          { type: 'text', text: `Opened ${name} in the viewer.` },
+          openTargetContentBlock(structured),
+        ],
         structuredContent: structured,
       };
     },
@@ -594,7 +617,10 @@ async function main(): Promise<void> {
       };
       pendingOpenTarget = structured;
       return {
-        content: [{ type: 'text', text: `Opening ${name} for compression (compression: ${compression ?? 'medium'})...` }],
+        content: [
+          { type: 'text', text: `Opening ${name} for compression (compression: ${compression ?? 'medium'})...` },
+          openTargetContentBlock(structured),
+        ],
         structuredContent: structured,
       };
     },
@@ -644,7 +670,10 @@ async function main(): Promise<void> {
       };
       pendingOpenTarget = structured;
       return {
-        content: [{ type: 'text', text: `Opening ${files[0].name} for merge (${paths.length} files)...` }],
+        content: [
+          { type: 'text', text: `Opening ${files[0].name} for merge (${paths.length} files)...` },
+          openTargetContentBlock(structured),
+        ],
         structuredContent: structured,
       };
     },
@@ -693,7 +722,10 @@ async function main(): Promise<void> {
       };
       pendingOpenTarget = structured;
       return {
-        content: [{ type: 'text', text: `Opening ${name} for split...` }],
+        content: [
+          { type: 'text', text: `Opening ${name} for split...` },
+          openTargetContentBlock(structured),
+        ],
         structuredContent: structured,
       };
     },

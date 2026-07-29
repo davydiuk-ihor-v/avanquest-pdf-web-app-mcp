@@ -3250,20 +3250,38 @@ function shouldAutoFullscreen(token: string): Promise<boolean> {
     .catch(() => true);
 }
 
+type OpenTarget = { token?: string; name?: string; filePath?: string; command?: ToolCommand };
+
+// Every observed host strips `structuredContent` from `ontoolresult` (confirmed
+// via debug logging: absent on every firing, live open or historical replay).
+// `get_pending_open`'s fallback returns a single server-process-wide "last
+// opened" pointer, which is wrong for a remounted widget once some OTHER
+// conversation has opened a different document since. The tool's own `content`
+// array reliably differs per call and is not affected by whatever strips
+// structuredContent, so the server also embeds the open target there (see
+// `openTargetContentBlock` in src/server.ts) — check that first.
+function parseOpenTargetFromContent(result: { content?: Array<{ text?: string }> }): OpenTarget | undefined {
+  for (const block of result.content ?? []) {
+    if (!block.text) continue;
+    try {
+      const parsed = JSON.parse(block.text) as { open?: OpenTarget };
+      if (parsed.open?.token && parsed.open?.name) return parsed.open;
+    } catch { /* not our JSON block, keep looking */ }
+  }
+  return undefined;
+}
+
 app.ontoolresult = async (result) => {
-  let data = (result as {
-    structuredContent?: { token?: string; name?: string; filePath?: string; command?: ToolCommand };
-  }).structuredContent;
-  // Some hosts (e.g. Claude Desktop 1.20186, which declares no structuredContent
-  // capability) strip structuredContent from the tool-result notification, so
-  // `data` is undefined even on success. Recover the open target over the
-  // app->server callServerTool channel, which is NOT stripped.
+  let data = (result as { structuredContent?: OpenTarget }).structuredContent;
+  if (!(data?.token && data.name)) {
+    data = parseOpenTargetFromContent(result as { content?: Array<{ text?: string }> });
+  }
+  // Last-resort fallback for hosts where neither of the above arrives (e.g. very
+  // old cached widget builds): ask the server for the last-known open target.
   if (!(data?.token && data.name)) {
     try {
       const r = await (app as any).callServerTool({ name: 'get_pending_open', arguments: {} });
-      const parsed = JSON.parse((r.content?.[0] as { text?: string })?.text ?? '{}') as {
-        open?: { token?: string; name?: string; filePath?: string; command?: ToolCommand };
-      };
+      const parsed = JSON.parse((r.content?.[0] as { text?: string })?.text ?? '{}') as { open?: OpenTarget };
       if (parsed.open?.token && parsed.open?.name) data = parsed.open;
     } catch { /* leave data as-is; open is skipped below if still empty */ }
   }
