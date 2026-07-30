@@ -450,7 +450,6 @@ const app = new App(
   { name: 'Avanquest PDF Viewer', version: '0.4.0' },
   { availableDisplayModes: ['inline', 'fullscreen'] },
 );
-
 // Intercept report_viewer_result to automatically inject current doc state (_pageCount, _currentPage).
 // This gives the server fresh page count after every operation so Claude doesn't work with stale state.
 {
@@ -648,12 +647,55 @@ setInterval(scheduleModalCheck, 120);
 // snappier than waiting for the next poll tick.
 document.addEventListener('pointerup', scheduleModalCheck, true);
 
+// While locked into fullscreen, the host sometimes sends a brief spurious
+// 'inline' blip during ordinary tool operations that reverts to 'fullscreen'
+// again almost immediately — the pre-existing guard below ignores those.
+// But clicking the widget's own close ("X") button ALSO sends a genuine,
+// sustained 'inline' (confirmed via on-screen debug logging: no onteardown
+// call ever happens on close, just this hostcontextchanged), which looks
+// identical to the spurious case at the instant it arrives. The old guard
+// ignored it forever, so closing via "X" left us stuck applying the old
+// locked (large) fullscreen height forever after — RDB-7709's real cause.
+// Debounce instead: if 'inline' doesn't get superseded by a 'fullscreen'
+// signal shortly, treat it as real and unlock.
+let _inlineConfirmTimer: ReturnType<typeof setTimeout> | undefined;
+
 app.addEventListener('hostcontextchanged', (ctx: any) => {
+  const ctxMode = ctx?.displayMode;
+  if (ctxMode === 'inline' && _lockedFullscreenH > 0 && _inlineConfirmTimer === undefined) {
+    _inlineConfirmTimer = setTimeout(() => {
+      _inlineConfirmTimer = undefined;
+      _lockedFullscreenH = 0;
+      updateFullscreenBtn('inline');
+      applyContainerHeight({ displayMode: 'inline' });
+    }, 500);
+  } else if (ctxMode === 'fullscreen' && _inlineConfirmTimer !== undefined) {
+    clearTimeout(_inlineConfirmTimer);
+    _inlineConfirmTimer = undefined;
+  }
   applyContainerHeight(ctx);
   if (ctx?.displayMode && !(_lockedFullscreenH > 0 && ctx.displayMode === 'inline')) {
     updateFullscreenBtn(ctx.displayMode);
   }
 });
+
+// Defensive cleanup for hosts that do send a real ui/resource-teardown
+// request before unmounting the widget. Confirmed via on-screen debug
+// logging that clicking this widget's own close ("X") button in Claude
+// Desktop does NOT trigger this at all — that case (RDB-7709) is actually
+// fixed by the hostcontextchanged handler above. Kept here regardless, in
+// case some other host path does invoke it.
+app.onteardown = async () => {
+  _modalOpen = false;
+  document.body.style.transform = '';
+  document.documentElement.style.background = '';
+  _lockedFullscreenH = 0;
+  try {
+    const result = await (app as any).requestDisplayMode({ mode: 'inline' });
+    updateFullscreenBtn(result?.mode ?? 'inline');
+  } catch (_) {}
+  return {};
+};
 
 const CHUNK_SIZE = 256 * 1024;
 
@@ -728,6 +770,16 @@ async function saveFileBytes(bytes: Uint8Array, defaultPath: string): Promise<vo
 
 let editorReady: Promise<ViewerResult> | null = null;
 
+// The vendor viewer auto-fits its initial zoom to whatever size our
+// container happens to be at construction time — which can be tiny, since
+// the host reports our real allocated size asynchronously (after PdfEditor()
+// is already constructed), and that initial fit-zoom never recomputes once
+// our container grows. Force a sane, predictable 100% zoom right after each
+// document loads instead of trusting the auto-fit.
+function resetZoomTo100(docVm: any): void {
+  try { docVm?.setZoom?.(1); } catch (_) { /* non-fatal */ }
+}
+
 // Mount the viewer once. `initialFile`, when given, is opened by the viewer as
 // part of initialization (via `initialDocument`) rather than as a separate
 // post-init openFile() call — one mount + open instead of two phases.
@@ -787,13 +839,14 @@ function initEditor(initialFile?: File): Promise<ViewerResult> {
     // Handles all subsequent display_pdf calls; the first open is handled separately below.
     svc?.documentOpened$?.subscribe?.((docVm: any) => {
       _currentDocumentView = docVm;
+      resetZoomTo100(docVm);
       // Resolve the pending openPdf() Promise so commands are unblocked.
       if (_resolveDocOpen) { const r = _resolveDocOpen; _resolveDocOpen = null; r(); }
       // Notify server that the new document is ready (clears _pendingDocOpen gate).
       (app as any).callServerTool({ name: 'report_viewer_result', arguments: { type: 'doc_opened' } }).catch(() => {});
     });
     const initial = svc?.getActiveDocumentViewElement?.()?.documentView;
-    if (initial) _currentDocumentView = initial;
+    if (initial) { _currentDocumentView = initial; resetZoomTo100(initial); }
 
     statusEl.style.display = 'none';
     return result;
@@ -854,7 +907,7 @@ async function openPdf(token: string, name: string, filePath?: string): Promise<
   } catch { /* timeout or open error — proceed with whatever document is active */ }
   // After openDocument resolves, read the active document directly.
   const activeVm = svc?.getActiveDocumentViewElement?.()?.documentView;
-  if (activeVm) _currentDocumentView = activeVm;
+  if (activeVm) { _currentDocumentView = activeVm; resetZoomTo100(activeVm); }
   // Unblock the server-side command gate.
   (app as any).callServerTool({ name: 'report_viewer_result', arguments: { type: 'doc_opened' } }).catch(() => {});
   statusEl.style.display = 'none';
@@ -1561,6 +1614,7 @@ async function handleReadDocumentInfo(): Promise<void> {
       isSigned: doc.isSigned ?? false,
       isModified: doc.isModified ?? false,
       isReadOnly: doc.isReadOnly ?? false,
+      ownerPasswordRequired: ownerPasswordRequired(doc),
     };
     await (app as any).callServerTool({
       name: 'report_viewer_result',
@@ -1815,10 +1869,23 @@ async function handleReplaceText(data: { searchText: string; replaceWith: string
   }
 }
 
+// A document with owner-level restrictions (security.requiresOwnerPassword)
+// that hasn't been unlocked yet (security.knownOwnerPassword empty) still
+// "opens" and renders its already-loaded pages, but the underlying engine
+// treats it as a locked shell for anything requiring a deeper parse (e.g.
+// bookmarks) — reporting misleadingly empty results ("no bookmarks, 2
+// pages") instead of a clear "this needs a password" error.
+function ownerPasswordRequired(doc: any): boolean {
+  return !!doc?.security?.requiresOwnerPassword && !doc?.security?.knownOwnerPassword;
+}
+
 async function handleReadBookmarks(): Promise<void> {
   try {
     const doc = (_currentDocumentView as any)?.getDocument?.();
     if (!doc) throw new Error('document not available');
+    if (ownerPasswordRequired(doc)) {
+      throw new Error('This document has an owner password set. Its bookmarks cannot be read until it is unlocked with that password.');
+    }
     const raw: any[] = doc.bookmarks ?? [];
     const result: { path: number[]; title: string; page: number }[] = [];
     const walk = (items: any[], parentPath: number[]) => {
