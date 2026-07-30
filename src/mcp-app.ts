@@ -770,6 +770,16 @@ async function saveFileBytes(bytes: Uint8Array, defaultPath: string): Promise<vo
 
 let editorReady: Promise<ViewerResult> | null = null;
 
+// The vendor viewer auto-fits its initial zoom to whatever size our
+// container happens to be at construction time — which can be tiny, since
+// the host reports our real allocated size asynchronously (after PdfEditor()
+// is already constructed), and that initial fit-zoom never recomputes once
+// our container grows. Force a sane, predictable 100% zoom right after each
+// document loads instead of trusting the auto-fit.
+function resetZoomTo100(docVm: any): void {
+  try { docVm?.setZoom?.(1); } catch (_) { /* non-fatal */ }
+}
+
 // Mount the viewer once. `initialFile`, when given, is opened by the viewer as
 // part of initialization (via `initialDocument`) rather than as a separate
 // post-init openFile() call — one mount + open instead of two phases.
@@ -829,13 +839,14 @@ function initEditor(initialFile?: File): Promise<ViewerResult> {
     // Handles all subsequent display_pdf calls; the first open is handled separately below.
     svc?.documentOpened$?.subscribe?.((docVm: any) => {
       _currentDocumentView = docVm;
+      resetZoomTo100(docVm);
       // Resolve the pending openPdf() Promise so commands are unblocked.
       if (_resolveDocOpen) { const r = _resolveDocOpen; _resolveDocOpen = null; r(); }
       // Notify server that the new document is ready (clears _pendingDocOpen gate).
       (app as any).callServerTool({ name: 'report_viewer_result', arguments: { type: 'doc_opened' } }).catch(() => {});
     });
     const initial = svc?.getActiveDocumentViewElement?.()?.documentView;
-    if (initial) _currentDocumentView = initial;
+    if (initial) { _currentDocumentView = initial; resetZoomTo100(initial); }
 
     statusEl.style.display = 'none';
     return result;
@@ -896,7 +907,7 @@ async function openPdf(token: string, name: string, filePath?: string): Promise<
   } catch { /* timeout or open error — proceed with whatever document is active */ }
   // After openDocument resolves, read the active document directly.
   const activeVm = svc?.getActiveDocumentViewElement?.()?.documentView;
-  if (activeVm) _currentDocumentView = activeVm;
+  if (activeVm) { _currentDocumentView = activeVm; resetZoomTo100(activeVm); }
   // Unblock the server-side command gate.
   (app as any).callServerTool({ name: 'report_viewer_result', arguments: { type: 'doc_opened' } }).catch(() => {});
   statusEl.style.display = 'none';
@@ -1603,6 +1614,7 @@ async function handleReadDocumentInfo(): Promise<void> {
       isSigned: doc.isSigned ?? false,
       isModified: doc.isModified ?? false,
       isReadOnly: doc.isReadOnly ?? false,
+      ownerPasswordRequired: ownerPasswordRequired(doc),
     };
     await (app as any).callServerTool({
       name: 'report_viewer_result',
@@ -1857,10 +1869,23 @@ async function handleReplaceText(data: { searchText: string; replaceWith: string
   }
 }
 
+// A document with owner-level restrictions (security.requiresOwnerPassword)
+// that hasn't been unlocked yet (security.knownOwnerPassword empty) still
+// "opens" and renders its already-loaded pages, but the underlying engine
+// treats it as a locked shell for anything requiring a deeper parse (e.g.
+// bookmarks) — reporting misleadingly empty results ("no bookmarks, 2
+// pages") instead of a clear "this needs a password" error.
+function ownerPasswordRequired(doc: any): boolean {
+  return !!doc?.security?.requiresOwnerPassword && !doc?.security?.knownOwnerPassword;
+}
+
 async function handleReadBookmarks(): Promise<void> {
   try {
     const doc = (_currentDocumentView as any)?.getDocument?.();
     if (!doc) throw new Error('document not available');
+    if (ownerPasswordRequired(doc)) {
+      throw new Error('This document has an owner password set. Its bookmarks cannot be read until it is unlocked with that password.');
+    }
     const raw: any[] = doc.bookmarks ?? [];
     const result: { path: number[]; title: string; page: number }[] = [];
     const walk = (items: any[], parentPath: number[]) => {
