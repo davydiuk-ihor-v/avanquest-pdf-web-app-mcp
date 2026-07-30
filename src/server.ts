@@ -10,7 +10,7 @@ import express from 'express';
 import cors from 'cors';
 import { z } from 'zod';
 import fs from 'node:fs/promises';
-import { createReadStream, existsSync, realpathSync } from 'node:fs';
+import { createReadStream, existsSync, realpathSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -129,6 +129,30 @@ function mintToken(fullPath: string, name: string, isTemp = false): string {
   const token = randomUUID();
   fileTokens.set(token, { fullPath, name, expiresAt: Date.now() + TOKEN_TTL_MS, isTemp });
   return token;
+}
+
+// Persisted across Claude Desktop restarts (see fullscreenGrantedTokens above).
+// Capped so the file can't grow unbounded over months of use — oldest entries
+// are dropped first once past the cap.
+const FULLSCREEN_STATE_PATH = path.join(os.homedir(), '.avanquest-pdf-viewer', 'fullscreen-granted-tokens.json');
+const FULLSCREEN_STATE_MAX = 500;
+
+function loadFullscreenGrantedTokens(): Set<string> {
+  try {
+    const arr = JSON.parse(readFileSync(FULLSCREEN_STATE_PATH, 'utf-8')) as unknown;
+    return Array.isArray(arr) ? new Set(arr.filter((v) => typeof v === 'string')) : new Set();
+  } catch {
+    return new Set();
+  }
+}
+
+function saveFullscreenGrantedTokens(tokens: Set<string>): void {
+  try {
+    mkdirSync(path.dirname(FULLSCREEN_STATE_PATH), { recursive: true });
+    const arr = Array.from(tokens);
+    const trimmed = arr.length > FULLSCREEN_STATE_MAX ? arr.slice(arr.length - FULLSCREEN_STATE_MAX) : arr;
+    writeFileSync(FULLSCREEN_STATE_PATH, JSON.stringify(trimmed), 'utf-8');
+  } catch { /* non-fatal — worst case, next restart re-grants fullscreen once */ }
 }
 
 async function downloadPdfFromUrl(pdfUrl: string): Promise<{ tempPath: string; name: string }> {
@@ -761,7 +785,12 @@ async function main(): Promise<void> {
   // first widget to claim a given token gets fullscreen; every later claim for
   // that same token (any remount) is denied and stays inline with its manual
   // expand button.
-  const fullscreenGrantedTokens = new Set<string>();
+  //
+  // This Set must survive across Claude Desktop restarts, not just within one
+  // server process's lifetime — otherwise every restart forgets which tokens
+  // were already granted, and every widget still open in chat history goes
+  // fullscreen again on the next remount. Persisted to a small JSON file.
+  const fullscreenGrantedTokens = loadFullscreenGrantedTokens();
 
   type TR = { content: [{ type: 'text'; text: string }]; isError?: true };
   const ok  = (text: string): TR => ({ content: [{ type: 'text' as const, text }] });
@@ -2274,7 +2303,10 @@ async function main(): Promise<void> {
     async ({ token }) => {
       const key = token ?? '';
       const allow = !fullscreenGrantedTokens.has(key);
-      fullscreenGrantedTokens.add(key);
+      if (allow) {
+        fullscreenGrantedTokens.add(key);
+        saveFullscreenGrantedTokens(fullscreenGrantedTokens);
+      }
       return {
         content: [{ type: 'text' as const, text: JSON.stringify({ allow }) }],
       };
