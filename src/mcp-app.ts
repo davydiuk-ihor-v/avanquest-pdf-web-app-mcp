@@ -450,7 +450,6 @@ const app = new App(
   { name: 'Avanquest PDF Viewer', version: '0.4.0' },
   { availableDisplayModes: ['inline', 'fullscreen'] },
 );
-
 // Intercept report_viewer_result to automatically inject current doc state (_pageCount, _currentPage).
 // This gives the server fresh page count after every operation so Claude doesn't work with stale state.
 {
@@ -648,12 +647,55 @@ setInterval(scheduleModalCheck, 120);
 // snappier than waiting for the next poll tick.
 document.addEventListener('pointerup', scheduleModalCheck, true);
 
+// While locked into fullscreen, the host sometimes sends a brief spurious
+// 'inline' blip during ordinary tool operations that reverts to 'fullscreen'
+// again almost immediately — the pre-existing guard below ignores those.
+// But clicking the widget's own close ("X") button ALSO sends a genuine,
+// sustained 'inline' (confirmed via on-screen debug logging: no onteardown
+// call ever happens on close, just this hostcontextchanged), which looks
+// identical to the spurious case at the instant it arrives. The old guard
+// ignored it forever, so closing via "X" left us stuck applying the old
+// locked (large) fullscreen height forever after — RDB-7709's real cause.
+// Debounce instead: if 'inline' doesn't get superseded by a 'fullscreen'
+// signal shortly, treat it as real and unlock.
+let _inlineConfirmTimer: ReturnType<typeof setTimeout> | undefined;
+
 app.addEventListener('hostcontextchanged', (ctx: any) => {
+  const ctxMode = ctx?.displayMode;
+  if (ctxMode === 'inline' && _lockedFullscreenH > 0 && _inlineConfirmTimer === undefined) {
+    _inlineConfirmTimer = setTimeout(() => {
+      _inlineConfirmTimer = undefined;
+      _lockedFullscreenH = 0;
+      updateFullscreenBtn('inline');
+      applyContainerHeight({ displayMode: 'inline' });
+    }, 500);
+  } else if (ctxMode === 'fullscreen' && _inlineConfirmTimer !== undefined) {
+    clearTimeout(_inlineConfirmTimer);
+    _inlineConfirmTimer = undefined;
+  }
   applyContainerHeight(ctx);
   if (ctx?.displayMode && !(_lockedFullscreenH > 0 && ctx.displayMode === 'inline')) {
     updateFullscreenBtn(ctx.displayMode);
   }
 });
+
+// Defensive cleanup for hosts that do send a real ui/resource-teardown
+// request before unmounting the widget. Confirmed via on-screen debug
+// logging that clicking this widget's own close ("X") button in Claude
+// Desktop does NOT trigger this at all — that case (RDB-7709) is actually
+// fixed by the hostcontextchanged handler above. Kept here regardless, in
+// case some other host path does invoke it.
+app.onteardown = async () => {
+  _modalOpen = false;
+  document.body.style.transform = '';
+  document.documentElement.style.background = '';
+  _lockedFullscreenH = 0;
+  try {
+    const result = await (app as any).requestDisplayMode({ mode: 'inline' });
+    updateFullscreenBtn(result?.mode ?? 'inline');
+  } catch (_) {}
+  return {};
+};
 
 const CHUNK_SIZE = 256 * 1024;
 
