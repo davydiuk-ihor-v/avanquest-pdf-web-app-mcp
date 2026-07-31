@@ -106,6 +106,28 @@ const requireFromHere = createRequire(import.meta.url);
 const viewerEntryPath = requireFromHere.resolve('@avanquest/pdf-web-viewer');
 const viewerRoot = path.dirname(path.dirname(viewerEntryPath));
 
+let workerManifestPromise: Promise<Record<string, string>> | null = null;
+// Resolves the stable pdfworker.{js,wasm,data} aliases to the package's actual
+// content-hashed filenames (e.g. pdfworker-3fbbfcb6.js). The package no longer ships
+// a physical pwv-workers/manifest.json for this; instead it embeds the same
+// name->hash map as an escaped JSON string literal inside sdk/index.js at build time
+// — the exact data its own public `resolveWorkerPath()` reads internally (verified:
+// resolveWorkerPath() returns the identical hashed filename with no manifest.json on
+// disk). Match on the semantic "pdfworker.<ext>" keys, not minifier-assigned variable
+// names, so this keeps working across vendor re-bundles.
+function getWorkerManifest(): Promise<Record<string, string>> {
+  if (!workerManifestPromise) {
+    workerManifestPromise = (async () => {
+      const sdkPath = path.join(viewerRoot, 'sdk', 'index.js');
+      const raw = await fs.readFile(sdkPath, 'utf8');
+      const m = /"(\{\\"pdfworker\.(?:js|wasm|data)\\"[\s\S]*?\\"\})"/.exec(raw);
+      if (!m) throw new Error('worker asset manifest not found in sdk bundle');
+      return JSON.parse(m[1].replace(/\\"/g, '"')) as Record<string, string>;
+    })();
+  }
+  return workerManifestPromise;
+}
+
 const STUB_HTML_PATH = path.join(__dirname, 'mcp-app.html');
 const DIAG_HTML_PATH = path.join(__dirname, 'diag.html');
 
@@ -343,7 +365,16 @@ async function startAssetServer(): Promise<{ port: number; baseUrl: string }> {
           res.type('application/javascript').status(403).send('export default null; // forbidden');
           return;
         }
-        buf = await fs.readFile(abs);
+        try {
+          buf = await fs.readFile(abs);
+        } catch (err) {
+          const aliasMatch = /^pdfworker\.(js|wasm|data)$/.exec(path.basename(abs));
+          if (!aliasMatch) throw err;
+          const manifest = await getWorkerManifest();
+          const real = manifest[`pdfworker.${aliasMatch[1]}`];
+          if (!real) throw err;
+          buf = await fs.readFile(path.join(path.dirname(abs), real));
+        }
       } else {
         res.type('application/javascript').status(404).send('export default null; // unknown asset class');
         return;
