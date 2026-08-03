@@ -81,9 +81,7 @@ function show(msg: string, isError = false): void {
   if (!isError && !DEBUG_UI) { beacon(msg); return; }
   if (_statusHideTimer !== undefined) { clearTimeout(_statusHideTimer); _statusHideTimer = undefined; }
   statusEl.style.display = 'block';
-  statusEl.style.background = isError ? '#fee' : '#fff';
-  statusEl.style.border = isError ? '1px solid #f33' : '1px solid #ccc';
-  statusEl.style.color = isError ? '#900' : '#333';
+  statusEl.classList.toggle('status-error', isError);
   statusEl.textContent = msg;
   beacon(isError ? `ERROR: ${msg}` : msg);
   // Auto-dismiss error toasts so they don't linger on screen forever. Success
@@ -91,6 +89,66 @@ function show(msg: string, isError = false): void {
   if (isError) {
     _statusHideTimer = setTimeout(() => { statusEl.style.display = 'none'; _statusHideTimer = undefined; }, 6000);
   }
+}
+
+// RDB-7732: dedicated, higher-contrast toast for every flow that writes bytes
+// to disk via saveChunked() (Save, Save As, Extract Images/Pages, Export
+// Comments, Convert to Images, Split, Merge, Compress). Kept separate from
+// #status/show() above — that element is a plain text node shared by ~140
+// unrelated call sites, so it stays untouched; this one owns its own icon,
+// optional file-path line, and optional progress bar.
+const saveToastEl = document.getElementById('save-toast')!;
+const saveToastIconEl = document.getElementById('save-toast-icon')!;
+const saveToastTextEl = document.getElementById('save-toast-text')!;
+const saveToastPathEl = document.getElementById('save-toast-path')!;
+const saveToastProgressTrackEl = document.getElementById('save-toast-progress-track') as HTMLElement;
+const saveToastProgressBarEl = document.getElementById('save-toast-progress-bar') as HTMLElement;
+
+const SAVE_TOAST_ICONS: Record<'success' | 'error', string> = {
+  success: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 12 9 17 20 6"/></svg>',
+  error: '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="6" y1="6" x2="18" y2="18"/><line x1="18" y1="6" x2="6" y2="18"/></svg>',
+};
+
+let _saveToastHideTimer: ReturnType<typeof setTimeout> | undefined;
+
+function renderSaveToast(state: 'progress' | 'success' | 'error', text: string, opts?: { path?: string; percent?: number }): void {
+  if (_saveToastHideTimer !== undefined) { clearTimeout(_saveToastHideTimer); _saveToastHideTimer = undefined; }
+  saveToastEl.style.display = 'flex';
+  saveToastEl.dataset.state = state;
+  saveToastIconEl.innerHTML = state === 'progress' ? '' : SAVE_TOAST_ICONS[state];
+  saveToastTextEl.textContent = text;
+  if (opts?.path) {
+    saveToastPathEl.style.display = 'block';
+    saveToastPathEl.textContent = opts.path;
+    saveToastPathEl.title = opts.path;
+  } else {
+    saveToastPathEl.style.display = 'none';
+    saveToastPathEl.textContent = '';
+    saveToastPathEl.removeAttribute('title');
+  }
+  if (typeof opts?.percent === 'number') {
+    saveToastProgressTrackEl.style.display = 'block';
+    saveToastProgressBarEl.style.width = `${Math.max(0, Math.min(100, opts.percent))}%`;
+  } else {
+    saveToastProgressTrackEl.style.display = 'none';
+  }
+}
+
+function showSaveProgress(label: string, percent?: number): void {
+  const text = typeof percent === 'number' ? `${label}… ${Math.round(percent)}%` : `${label}…`;
+  renderSaveToast('progress', text, { percent });
+}
+
+function showSaveSuccess(text: string, path?: string): void {
+  renderSaveToast('success', text, { path });
+  beacon(text + (path ? ` (${path})` : ''));
+  _saveToastHideTimer = setTimeout(() => { saveToastEl.style.display = 'none'; _saveToastHideTimer = undefined; }, 4000);
+}
+
+function showSaveError(text: string): void {
+  renderSaveToast('error', text);
+  beacon(`ERROR: ${text}`);
+  _saveToastHideTimer = setTimeout(() => { saveToastEl.style.display = 'none'; _saveToastHideTimer = undefined; }, 6000);
 }
 
 beacon(`boot: js running, location=${location.href}, base=${base}, license=${license ? 'set' : 'MISSING'}`);
@@ -784,28 +842,10 @@ async function saveFileBytes(bytes: Uint8Array, defaultPath: string): Promise<vo
   const savePath = await showSaveDialog(defaultPath);
   if (!savePath) return;
   try {
-    statusEl.style.display = 'block';
-    statusEl.textContent = 'Saving…';
-    let offset = 0;
-    while (offset < bytes.length) {
-      const chunk = bytes.slice(offset, offset + CHUNK_SIZE);
-      let b64 = '';
-      for (let i = 0; i < chunk.length; i += 65536) {
-        b64 += String.fromCharCode(...chunk.subarray(i, i + 65536));
-      }
-      await (app as any).callServerTool({
-        name: 'save_pdf',
-        arguments: { token: _currentToken, savePath, chunk: btoa(b64), offset, totalSize: bytes.length },
-      });
-      offset += chunk.length;
-      statusEl.textContent = `Saving… ${Math.round((offset / bytes.length) * 100)}%`;
-    }
-    statusEl.textContent = 'Saved!';
-    setTimeout(() => { statusEl.style.display = 'none'; }, 3000);
+    await saveChunked(bytes, savePath, 'Saving PDF');
+    showSaveSuccess('PDF saved successfully', savePath);
   } catch (err) {
-    statusEl.style.display = 'block';
-    statusEl.style.background = '#fee';
-    statusEl.textContent = `Save error: ${err instanceof Error ? err.message : String(err)}`;
+    showSaveError(`Save failed: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 
@@ -991,7 +1031,7 @@ const COMPRESS_QUALITY: Record<string, number> = {
   max: 0.15, high: 0.25, medium: 0.5, low: 0.75, min: 1.0,
 };
 
-async function saveChunked(bytes: Uint8Array, targetPath: string): Promise<void> {
+async function saveChunked(bytes: Uint8Array, targetPath: string, label = 'Saving'): Promise<void> {
   const totalSize = bytes.length;
   let offset = 0;
   while (offset < totalSize) {
@@ -1003,7 +1043,7 @@ async function saveChunked(bytes: Uint8Array, targetPath: string): Promise<void>
       arguments: { token: _currentToken, savePath: targetPath, chunk: btoa(bin), offset, totalSize },
     });
     offset += chunk.length;
-    statusEl.textContent = `Compressing… saving ${Math.round((offset / totalSize) * 100)}%`;
+    showSaveProgress(label, (offset / totalSize) * 100);
   }
 }
 
@@ -2122,7 +2162,7 @@ function buildZip(files: { name: string; data: Uint8Array }[]): Uint8Array {
 
 async function handleExtractImages(data: { outputPath: string; pages: number[] | null; format: string }): Promise<void> {
   try {
-    show('Extracting images…');
+    showSaveProgress('Extracting images');
     const doc = (_currentDocumentView as any)?.getDocument?.();
     if (!doc) throw new Error('document not available');
 
@@ -2157,11 +2197,9 @@ async function handleExtractImages(data: { outputPath: string; pages: number[] |
       throw new Error(`Unexpected extractImages result type: ${typeof raw}`);
     }
 
-    statusEl.textContent = `Saving ZIP (${(zipBytes.length / 1024).toFixed(0)} KB)…`;
-    await saveChunked(zipBytes, data.outputPath);
+    await saveChunked(zipBytes, data.outputPath, 'Saving images ZIP');
 
-    show(`Extracted images saved to ${data.outputPath}`);
-    setTimeout(() => { statusEl.style.display = 'none'; }, 4000);
+    showSaveSuccess('Images extracted successfully', data.outputPath);
 
     const count = Array.isArray(raw) ? (raw as any[]).length : 1;
     await (app as any).callServerTool({
@@ -2169,7 +2207,7 @@ async function handleExtractImages(data: { outputPath: string; pages: number[] |
       arguments: { type: 'extract_images', json: JSON.stringify({ success: true, path: data.outputPath, count }) },
     });
   } catch (err) {
-    show(`extract_images error: ${err instanceof Error ? err.message : String(err)}`, true);
+    showSaveError(`Extract images failed: ${err instanceof Error ? err.message : String(err)}`);
     try {
       await (app as any).callServerTool({
         name: 'report_viewer_result',
@@ -2183,7 +2221,7 @@ async function handleExtractImages(data: { outputPath: string; pages: number[] |
 
 async function handleExportComments(data: { outputPath: string }): Promise<void> {
   try {
-    show('Exporting comments…');
+    showSaveProgress('Exporting comments');
     const doc = (_currentDocumentView as any)?.getDocument?.();
     if (!doc) throw new Error('document not available');
 
@@ -2202,18 +2240,16 @@ async function handleExportComments(data: { outputPath: string }): Promise<void>
 
     if (bytes.length === 0) throw new Error('No comments to export');
 
-    statusEl.textContent = 'Saving comments…';
-    await saveChunked(bytes, data.outputPath);
+    await saveChunked(bytes, data.outputPath, 'Saving comments');
 
-    show(`Comments exported to ${data.outputPath}`);
-    setTimeout(() => { statusEl.style.display = 'none'; }, 3000);
+    showSaveSuccess('Comments exported successfully', data.outputPath);
 
     await (app as any).callServerTool({
       name: 'report_viewer_result',
       arguments: { type: 'export_comments', json: JSON.stringify({ success: true, path: data.outputPath }) },
     });
   } catch (err) {
-    show(`export_comments error: ${err instanceof Error ? err.message : String(err)}`, true);
+    showSaveError(`Export comments failed: ${err instanceof Error ? err.message : String(err)}`);
     try {
       await (app as any).callServerTool({
         name: 'report_viewer_result',
@@ -2899,21 +2935,19 @@ async function handleDeleteTextBlocks(data: { pageIndex: number; blockIndices: n
 
 async function handleConvertToImages(data: { dpi: number | null; outputPath: string }): Promise<void> {
   try {
-    show('Converting pages to images…');
+    showSaveProgress('Converting pages to images');
     const doc = (_currentDocumentView as any)?.getDocument?.();
     if (!doc) throw new Error('document not available');
     const zipFile: File = await (doc as any).convertToImages(data.dpi ?? undefined);
     const bytes = new Uint8Array(await zipFile.arrayBuffer());
-    statusEl.textContent = `Saving ZIP (${(bytes.length / 1024).toFixed(0)} KB)…`;
-    await saveChunked(bytes, data.outputPath);
-    show(`Images saved to ${data.outputPath}`);
-    setTimeout(() => { statusEl.style.display = 'none'; }, 4000);
+    await saveChunked(bytes, data.outputPath, 'Saving images ZIP');
+    showSaveSuccess('Pages converted to images successfully', data.outputPath);
     await (app as any).callServerTool({
       name: 'report_viewer_result',
       arguments: { type: 'convert_to_images', json: JSON.stringify({ success: true, path: data.outputPath }) },
     });
   } catch (err) {
-    show(`convert_to_images error: ${err instanceof Error ? err.message : String(err)}`, true);
+    showSaveError(`Convert to images failed: ${err instanceof Error ? err.message : String(err)}`);
     try {
       await (app as any).callServerTool({
         name: 'report_viewer_result',
@@ -2925,21 +2959,19 @@ async function handleConvertToImages(data: { dpi: number | null; outputPath: str
 
 async function handleExtractPages(data: { Range: string[]; outputPath: string }): Promise<void> {
   try {
-    show('Extracting pages…');
+    showSaveProgress('Extracting pages');
     const doc = (_currentDocumentView as any)?.getDocument?.();
     if (!doc) throw new Error('document not available');
     const raw = await (doc as any).extractPages({ Range: data.Range });
     const bytes = new Uint8Array(raw instanceof ArrayBuffer ? raw : (raw as ArrayBufferView).buffer);
-    statusEl.textContent = `Saving extracted PDF (${(bytes.length / 1024).toFixed(0)} KB)…`;
-    await saveChunked(bytes, data.outputPath);
-    show(`Pages extracted to ${data.outputPath}`);
-    setTimeout(() => { statusEl.style.display = 'none'; }, 3000);
+    await saveChunked(bytes, data.outputPath, 'Saving extracted PDF');
+    showSaveSuccess('Pages extracted successfully', data.outputPath);
     await (app as any).callServerTool({
       name: 'report_viewer_result',
       arguments: { type: 'extract_pages', json: JSON.stringify({ success: true, path: data.outputPath }) },
     });
   } catch (err) {
-    show(`extract_pages error: ${err instanceof Error ? err.message : String(err)}`, true);
+    showSaveError(`Extract pages failed: ${err instanceof Error ? err.message : String(err)}`);
     try {
       await (app as any).callServerTool({
         name: 'report_viewer_result',
@@ -2951,7 +2983,7 @@ async function handleExtractPages(data: { Range: string[]; outputPath: string })
 
 async function handleSaveAs(data: { outputPath: string | null; fileName: string | null }): Promise<void> {
   try {
-    show('Saving copy…');
+    showSaveProgress('Saving copy');
     const doc = (_currentDocumentView as any)?.getDocument?.();
     if (!doc) throw new Error('document not available');
     const raw = await (doc as any).exportDocument({ as: 'uint8array' });
@@ -2962,17 +2994,15 @@ async function handleSaveAs(data: { outputPath: string | null; fileName: string 
       const name = data.fileName || 'document_copy.pdf';
       targetPath = dir ? `${dir}\\${name}` : name;
     }
-    statusEl.textContent = `Saving… (${(bytes.length / 1024).toFixed(0)} KB)`;
-    await saveChunked(bytes, targetPath);
+    await saveChunked(bytes, targetPath, 'Saving copy');
     _currentFilePath = targetPath;
-    show(`Saved as ${targetPath}`);
-    setTimeout(() => { statusEl.style.display = 'none'; }, 3000);
+    showSaveSuccess('PDF saved successfully', targetPath);
     await (app as any).callServerTool({
       name: 'report_viewer_result',
       arguments: { type: 'save_as', json: JSON.stringify({ success: true, path: targetPath }) },
     });
   } catch (err) {
-    show(`save_as error: ${err instanceof Error ? err.message : String(err)}`, true);
+    showSaveError(`Save failed: ${err instanceof Error ? err.message : String(err)}`);
     try {
       await (app as any).callServerTool({
         name: 'report_viewer_result',
@@ -3388,7 +3418,7 @@ function parseSplitRange(str: string, total: number): string[] {
 async function handleSplit(cmd: ToolCommand): Promise<void> {
   const { ranges, pagesPerFile, outputDir = '', baseName = 'split' } = cmd;
   try {
-    show('Splitting PDF…');
+    showSaveProgress('Splitting PDF');
     const doc = (_currentDocumentView as any)?.getDocument?.();
     if (!doc) throw new Error('document not available in viewer');
     const totalPages = ((doc as any).getPages() as unknown[]).length;
@@ -3411,59 +3441,55 @@ async function handleSplit(cmd: ToolCommand): Promise<void> {
     for (let i = 0; i < groups.length; i++) {
       const pages = groups[i];
       if (!pages.length) continue;
-      statusEl.textContent = `Split: extracting part ${i + 1} of ${groups.length}…`;
+      showSaveProgress(`Splitting — part ${i + 1} of ${groups.length}`);
       const extracted = new Uint8Array(await (doc as any).extractPages({ Range: pages }));
       const label = pages.length === 1 ? `p${pages[0]}` : `p${pages[0]}-${pages[pages.length - 1]}`;
       const outPath = outputDir ? `${outputDir}${sep}${baseName}_${label}.pdf` : `${baseName}_${label}.pdf`;
-      await saveChunked(extracted, outPath);
+      await saveChunked(extracted, outPath, `Saving part ${i + 1} of ${groups.length}`);
       saved.push(outPath);
     }
-    show(`Split into ${saved.length} file${saved.length !== 1 ? 's' : ''}`);
-    setTimeout(() => { statusEl.style.display = 'none'; }, 4000);
+    showSaveSuccess(`Split into ${saved.length} file${saved.length !== 1 ? 's' : ''}`, outputDir || undefined);
   } catch (err) {
-    show(`Split failed: ${err instanceof Error ? err.message : String(err)}`, true);
+    showSaveError(`Split failed: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 
 async function handleMerge(files: Array<{ token: string; name: string }>, outputPath: string): Promise<void> {
   try {
-    show(`Merging ${files.length} PDFs…`);
+    showSaveProgress(`Merging ${files.length} PDFs`);
     const doc = (_currentDocumentView as any)?.getDocument?.();
     if (!doc) throw new Error('document not available in viewer');
     for (let i = 1; i < files.length; i++) {
-      statusEl.textContent = `Merging… inserting file ${i + 1} of ${files.length} (${files[i].name})`;
+      showSaveProgress(`Merging — inserting file ${i + 1} of ${files.length} (${files[i].name})`);
       const bytes = await loadBytes(`file/${files[i].token}`);
       let bin = '';
       for (let j = 0; j < bytes.length; j += 65536) bin += String.fromCharCode(...bytes.subarray(j, j + 65536));
       const pageCount = (doc.getPages as () => unknown[])().length;
       await (doc as any).insertPagesFromFile({ index: pageCount, sourceFile: btoa(bin) });
     }
-    statusEl.textContent = `Exporting merged PDF…`;
+    showSaveProgress('Exporting merged PDF');
     const merged = new Uint8Array(await (doc as any).exportDocument({ as: 'uint8array' }));
     beacon(`merge done: ${merged.length} bytes → ${outputPath}`);
-    await saveChunked(merged, outputPath);
+    await saveChunked(merged, outputPath, 'Saving merged PDF');
     _currentFilePath = outputPath;
-    show(`Merged and saved to ${outputPath}`);
-    setTimeout(() => { statusEl.style.display = 'none'; }, 4000);
+    showSaveSuccess('PDFs merged successfully', outputPath);
   } catch (err) {
-    show(`Merge failed: ${err instanceof Error ? err.message : String(err)}`, true);
+    showSaveError(`Merge failed: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 
 async function handleCompress(compression: string, outputPath: string): Promise<void> {
   try {
-    show(`Compressing (compression: ${compression})…`);
+    showSaveProgress(`Compressing (${compression})`);
     const doc = (_currentDocumentView as any)?.getDocument?.();
     if (!doc) throw new Error('document not available in viewer');
     const qualityValue = COMPRESS_QUALITY[compression] ?? 0.5;
     const compressed = new Uint8Array(await doc.compress(qualityValue));
     beacon(`compress done: ${compressed.length} bytes → ${outputPath}`);
-    statusEl.textContent = `Compressed! Saving to ${outputPath}…`;
-    await saveChunked(compressed, outputPath);
-    show(`Compressed and saved to ${outputPath}`);
-    setTimeout(() => { statusEl.style.display = 'none'; }, 4000);
+    await saveChunked(compressed, outputPath, 'Saving compressed PDF');
+    showSaveSuccess('PDF compressed successfully', outputPath);
   } catch (err) {
-    show(`Compress failed: ${err instanceof Error ? err.message : String(err)}`, true);
+    showSaveError(`Compress failed: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 
