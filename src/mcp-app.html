@@ -9,11 +9,46 @@
       body { min-height: 720px; background: #fff; }
       #status {
         display: none;
-        position: absolute; top: 16px; left: 16px; right: 16px; z-index: 1000;
-        font: 13px ui-monospace, Menlo, monospace;
-        background: #fff; border: 1px solid #ccc; padding: 8px 12px; border-radius: 4px;
-        white-space: pre-wrap;
+        position: fixed; top: 16px; left: 50%; transform: translateX(-50%); z-index: 10000;
+        max-width: min(560px, calc(100% - 32px));
+        font: 13px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        background: #1e1e1e; color: #f2f2f2;
+        border: 1px solid #444; border-left: 3px solid #4a9eff;
+        padding: 10px 16px; border-radius: 8px;
+        box-shadow: 0 6px 20px rgba(0,0,0,0.35);
+        white-space: pre-wrap; text-align: center;
       }
+      #status.status-error { border-left-color: #f87171; }
+
+      #save-toast {
+        display: none;
+        position: fixed; top: 16px; left: 50%; transform: translateX(-50%); z-index: 10000;
+        min-width: 260px; max-width: min(420px, calc(100% - 32px));
+        align-items: flex-start; gap: 10px;
+        font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        background: #1e1e1e; color: #f2f2f2;
+        border: 1px solid #444; border-radius: 8px;
+        padding: 12px 14px;
+        box-shadow: 0 6px 20px rgba(0,0,0,0.35);
+      }
+      #save-toast-icon { flex: 0 0 auto; width: 18px; height: 18px; margin-top: 1px; display: flex; align-items: center; justify-content: center; }
+      #save-toast-body { min-width: 0; flex: 1 1 auto; }
+      #save-toast-text { font-weight: 600; white-space: pre-wrap; word-break: break-word; }
+      #save-toast-path {
+        display: none; margin-top: 3px; font: 11px ui-monospace, Menlo, monospace; color: #aaa;
+        white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      }
+      #save-toast-progress-track { display: none; margin-top: 8px; height: 4px; border-radius: 2px; background: #3a3a3a; overflow: hidden; }
+      #save-toast-progress-bar { height: 100%; width: 0%; background: #4a9eff; transition: width 0.15s ease; }
+
+      #save-toast[data-state="progress"] #save-toast-icon {
+        width: 16px; height: 16px; margin-top: 2px;
+        border: 2px solid rgba(255,255,255,0.25); border-top-color: #4a9eff; border-radius: 50%;
+        animation: pwv-save-toast-spin 0.8s linear infinite;
+      }
+      #save-toast[data-state="success"] #save-toast-icon svg { stroke: #22c55e; }
+      #save-toast[data-state="error"] #save-toast-icon svg { stroke: #f87171; }
+      @keyframes pwv-save-toast-spin { to { transform: rotate(360deg); } }
       #viewer { height: 720px; width: 100%; }
       #fullscreen-btn {
         display: none;
@@ -39,6 +74,14 @@
     <div id="status">loading…</div>
     <div id="viewer"></div>
     <button id="fullscreen-btn" title="Expand"></button>
+    <div id="save-toast">
+      <div id="save-toast-icon"></div>
+      <div id="save-toast-body">
+        <div id="save-toast-text"></div>
+        <div id="save-toast-path"></div>
+        <div id="save-toast-progress-track"><div id="save-toast-progress-bar"></div></div>
+      </div>
+    </div>
     <script>
       window.PWV_CONFIG = { base: "%%PWV_BASE%%", license: "%%PWV_LICENSE%%", proxy: "%%PWV_PROXY%%" };
     </script>
