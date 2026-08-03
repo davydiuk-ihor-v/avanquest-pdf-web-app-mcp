@@ -31,30 +31,56 @@ if (!LICENSE_KEY) {
 }
 
 // Directories `display_pdf` is allowed to open from. Configured via the mcpb
-// `user_config` "Allowed folders" prompt (manifest -> PWV_ALLOWED_DIRS_LIST), or
-// the PWV_ALLOWED_DIRS env (OS-path-separator list) for non-mcpb/dev use. When
-// neither is set, defaults to the user's common document locations.
-// `display_pdf` rejects anything outside these roots, so the model can't coax
-// the extension into reading arbitrary files.
+// `user_config` "Allowed PDF folders" prompt -- a `type: "directory", multiple:
+// true` field, passed through as its own `--allowed-dirs` argv entry (manifest
+// -> mcp_config.args), or the PWV_ALLOWED_DIRS env (OS-path-separator list) for
+// non-mcpb/dev use. When neither is set, defaults to the user's common
+// document locations. `display_pdf` rejects anything outside these roots, so
+// the model can't coax the extension into reading arbitrary files.
+//
+// RDB-7806: a `multiple: true` user_config value can only be expanded by
+// @anthropic-ai/mcpb when it is substituted as its own standalone `args` array
+// entry -- each selected folder becomes a separate argv string after
+// --allowed-dirs (see that package's replaceVariables: array-context
+// substitution spreads an array value in place, string-context substitution
+// explicitly refuses to interpolate an array and warns instead). Passing a
+// multi-select field through `env` (the previous approach here) silently
+// leaves the raw "${user_config...}" placeholder in place -- that was the
+// underlying bug the last attempt at multi-folder support ran into.
 function parseAllowedDirsConfig(): string[] {
-  // PWV_ALLOWED_DIRS_LIST is built from up to 4 individual directory user_config
-  // fields joined with "|". Unset optional fields stay as literal "${user_config.xxx}"
-  // -- filter those out. Also accept semicolon/newline/path.delimiter separators for
-  // manual PWV_ALLOWED_DIRS env var usage.
-  const fromUserConfig = process.env.PWV_ALLOWED_DIRS_LIST?.trim();
-  if (fromUserConfig) {
-    const entries = fromUserConfig.split(/[|\n;]/).flatMap((s) => s.split(path.delimiter));
-    const valid = entries.map((s) => s.trim()).filter((s) => s && !s.includes('${'));
+  const flagIndex = process.argv.indexOf('--allowed-dirs');
+  if (flagIndex !== -1) {
+    const values: string[] = [];
+    for (let i = flagIndex + 1; i < process.argv.length; i++) {
+      const arg = process.argv[i];
+      if (arg.startsWith('--')) break; // next flag -- stop collecting
+      values.push(arg);
+    }
+    // An unconfigured field resolves to zero argv entries; an unresolved
+    // template placeholder (shouldn't happen, but defensive) is filtered too.
+    const valid = values.map((s) => s.trim()).filter((s) => s && !s.includes('${'));
     if (valid.length > 0) return valid;
   }
+  // Manual dev/non-mcpb override: OS-path-separator-joined list.
   if (process.env.PWV_ALLOWED_DIRS) {
     return process.env.PWV_ALLOWED_DIRS.split(path.delimiter);
   }
-  return ['Documents', 'Downloads', 'Desktop', 'PDF'].map((d) => path.join(os.homedir(), d));
+  return ['Downloads', 'Documents', 'Desktop', 'PDF'].map((d) => path.join(os.homedir(), d));
+}
+
+// Neither Node's fs/path nor Claude Desktop's directory-picker UI expand a
+// leading "~" -- it's a shell convention, not something either side resolves
+// on our behalf. Expand it ourselves so a manually-typed "~/Downloads" (or
+// one that slips through from a manifest default some Claude Desktop version
+// does honor) still resolves to a real, usable folder.
+function expandHome(d: string): string {
+  if (d === '~') return os.homedir();
+  if (d.startsWith('~/') || d.startsWith('~\\')) return path.join(os.homedir(), d.slice(2));
+  return d;
 }
 
 const ALLOWED_DIRS: string[] = parseAllowedDirsConfig()
-  .map((d) => d.trim())
+  .map((d) => expandHome(d.trim()))
   .filter(Boolean)
   .map((d) => {
     try {
@@ -63,6 +89,11 @@ const ALLOWED_DIRS: string[] = parseAllowedDirsConfig()
       return path.resolve(d); // keep configured roots that don't exist yet
     }
   });
+
+// RDB-7806: "the first valid folder can be used as the default PDF folder" --
+// the folder the various export/save tools below suggest when the caller
+// doesn't specify an explicit output path.
+const DEFAULT_PDF_DIR: string = ALLOWED_DIRS[0] ?? path.join(os.homedir(), 'Downloads');
 
 /**
  * Resolve a requested path to a real file that is (a) a PDF and (b) located
@@ -86,16 +117,13 @@ function resolveAllowedPdf(requested: string): { ok: true; absolute: string } | 
 
   const inAllowed = ALLOWED_DIRS.some((root) => real === root || real.startsWith(root + path.sep));
   if (!inAllowed) {
-    const rawEnv = process.env.PWV_ALLOWED_DIRS_LIST;
-    const allPwvKeys = Object.keys(process.env).filter(k => k.startsWith('PWV'));
     return {
       ok: false,
       reason: [
         `Path is outside the allowed folders.`,
         `real path: ${real}`,
         `ALLOWED_DIRS: ${JSON.stringify(ALLOWED_DIRS)}`,
-        `PWV_ALLOWED_DIRS_LIST: ${JSON.stringify(rawEnv)}`,
-        `PWV env keys: ${allPwvKeys.join(', ')}`,
+        `argv: ${JSON.stringify(process.argv)}`,
       ].join('\n'),
     };
   }
@@ -1507,13 +1535,13 @@ async function main(): Promise<void> {
       annotations: { destructiveHint: true },
       description: 'Extract all raster images embedded in the currently open PDF and save them as a ZIP archive. Returns the path to the saved ZIP file.',
       inputSchema: {
-        outputPath: z.string().optional().describe('Where to save the ZIP file. Default: Downloads/extracted_images.zip'),
+        outputPath: z.string().optional().describe('Where to save the ZIP file. Defaults to the configured default PDF folder (extracted_images.zip).'),
         pages: z.array(z.number().int().min(1)).optional().describe('1-based page numbers to extract from. Omit to extract from all pages.'),
         format: z.enum(['png', 'jpeg']).optional().describe('Image format (default: png)'),
       },
     },
     async ({ outputPath, pages, format }) => {
-      const defaultDir = path.join(os.homedir(), 'Downloads');
+      const defaultDir = DEFAULT_PDF_DIR;
       const savePath = outputPath?.trim() || path.join(defaultDir, 'extracted_images.zip');
       return pollViewerResult<{ success: boolean; path?: string; count?: number; error?: string }>(
         { type: 'extract_images', outputPath: savePath, pages: pages ?? null, format: format ?? 'png' },
@@ -1534,11 +1562,11 @@ async function main(): Promise<void> {
       annotations: { destructiveHint: true },
       description: 'Export all comments and annotations from the currently open PDF as an FDF file.',
       inputSchema: {
-        outputPath: z.string().optional().describe('Where to save the .fdf file. Default: Downloads/comments.fdf'),
+        outputPath: z.string().optional().describe('Where to save the .fdf file. Defaults to the configured default PDF folder (comments.fdf).'),
       },
     },
     async ({ outputPath }) => {
-      const defaultDir = path.join(os.homedir(), 'Downloads');
+      const defaultDir = DEFAULT_PDF_DIR;
       const savePath = outputPath?.trim() || path.join(defaultDir, 'comments.fdf');
       return pollViewerResult<{ success: boolean; path?: string; error?: string }>(
         { type: 'export_comments', outputPath: savePath },
@@ -2074,11 +2102,11 @@ async function main(): Promise<void> {
         dpi: z.union([z.literal(1), z.literal(2), z.literal(3)]).optional()
           .describe('Resolution scale: 1 = 96 DPI (default), 2 = 192 DPI, 3 = 288 DPI.'),
         output_path: z.string().optional()
-          .describe('Absolute path for the output ZIP file. Defaults to Downloads/document_images.zip.'),
+          .describe('Absolute path for the output ZIP file. Defaults to the configured default PDF folder (document_images.zip).'),
       },
     },
     async ({ dpi, output_path }) => {
-      const defaultDir = path.join(os.homedir(), 'Downloads');
+      const defaultDir = DEFAULT_PDF_DIR;
       const savePath = output_path?.trim() || path.join(defaultDir, 'document_images.zip');
       return pollViewerResult<{ success: boolean; path?: string; error?: string }>(
         { type: 'convert_to_images', dpi: dpi ?? null, outputPath: savePath },
@@ -2101,13 +2129,13 @@ async function main(): Promise<void> {
       inputSchema: {
         range: z.array(z.string()).min(1).describe('1-based page ranges to extract, e.g. ["1-3","5","7-9"].'),
         output_path: z.string().optional()
-          .describe('Absolute output path for the extracted PDF. Defaults to Downloads/extracted_pages.pdf.'),
+          .describe('Absolute output path for the extracted PDF. Defaults to the configured default PDF folder (extracted_pages.pdf).'),
         file_name: z.string().optional()
           .describe('Filename override for the extracted PDF (without directory). Ignored when output_path is set.'),
       },
     },
     async ({ range, output_path, file_name }) => {
-      const defaultDir = path.join(os.homedir(), 'Downloads');
+      const defaultDir = DEFAULT_PDF_DIR;
       const savePath = output_path?.trim() || path.join(defaultDir, file_name?.trim() || 'extracted_pages.pdf');
       return pollViewerResult<{ success: boolean; path?: string; error?: string }>(
         { type: 'extract_pages', Range: range, outputPath: savePath },

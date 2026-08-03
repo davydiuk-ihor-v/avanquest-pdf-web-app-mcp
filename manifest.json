@@ -2,7 +2,7 @@
   "manifest_version": "0.4",
   "name": "avanquest-pdf-mcp-editor",
   "display_name": "Avanquest PDF Viewer",
-  "version": "0.4.240",
+  "version": "0.4.245",
   "description": "View PDF files inside Claude Desktop using the Avanquest PDF web viewer.",
   "long_description": "Provides a display_pdf tool that opens a local PDF file in an interactive viewer rendered inline in the Claude Desktop chat. Powered by @avanquest/pdf-web-viewer.",
   "author": {
@@ -36,11 +36,12 @@
     "mcp_config": {
       "command": "node",
       "args": [
-        "${__dirname}/dist/server.js"
+        "${__dirname}/dist/server.js",
+        "--allowed-dirs",
+        "${user_config.allowed_dirs}"
       ],
       "env": {
-        "PWV_LICENSE_KEY": "${user_config.license_key}",
-        "PWV_ALLOWED_DIRS_LIST": "${user_config.allowed_dir_1}"
+        "PWV_LICENSE_KEY": "${user_config.license_key}"
       }
     }
   },
@@ -52,11 +53,17 @@
       "sensitive": true,
       "required": true
     },
-    "allowed_dir_1": {
+    "allowed_dirs": {
       "type": "directory",
-      "title": "Default folder",
-      "description": "First folder the viewer may open PDFs from. Leave all folders empty to use defaults (Documents, Downloads, Desktop, PDF).",
-      "required": false
+      "title": "Allowed PDF folders",
+      "description": "Folders the viewer may open and save PDFs from. Pre-filled with your Downloads, Documents, and Desktop folders -- add, remove, or browse for more as needed. The first one is used as the default PDF folder.",
+      "multiple": true,
+      "required": false,
+      "default": [
+        "~/Downloads",
+        "~/Documents",
+        "~/Desktop"
+      ]
     }
   },
   "tools": [
