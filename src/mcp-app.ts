@@ -595,6 +595,49 @@ function collectAllElements(root: Element | ShadowRoot, out: Element[]): void {
   }
 }
 
+// The vendor's own header-top row (search/view-options/zoom/user-profile
+// cluster — id="pwv-header-top", right-aligned children under
+// id="pwv-header-top-right") sits flush against the right edge of its Shadow
+// DOM host, leaving no room for our Expand/Collapse button without
+// overlapping it (RDB-7720). `result.ui.pdfWebElement` (see initEditor) is a
+// real custom element mounted with an OPEN shadow root, so we can reach
+// straight into it via `.shadowRoot` right after mount instead of polling the
+// whole document for a class name. Pad #pwv-header-top so its right-aligned
+// content shifts left, then dock our button in the freed space (see
+// #fullscreen-btn's `right` offset in mcp-app.html).
+//
+// Below a 1024px container width the vendor's own `@container` query hides
+// #pwv-header-top entirely and relocates that same search/zoom/view-options
+// cluster into #pwv-header-bottom-mobile-tools (a totally different element,
+// rendered as the sole visible row at narrow widths) with only a 0.25rem
+// margin — not enough to clear our button either, so it needs the same
+// treatment.
+//
+// The search panel (.pwv-search-wrapper, opened via the loop/search icon) is
+// yet a third, independent case: it's `position: absolute; right: 0.375rem`,
+// floating on top of the header row rather than laid out inside it, so it
+// ignores both paddings above and its own Close button ends up under ours.
+// At container widths <=1024px the vendor's own CSS drops its `max-width`
+// cap and pins `right: 0` for an edge-to-edge bar, so widening `right` alone
+// would push the whole bar past the left edge — `width` must shrink by the
+// same amount to compensate. In the normal (wide) case `max-width` already
+// caps the rendered width well below 100%, so the `width` override there is
+// a no-op and only `right` matters.
+//
+// Idempotent via the id check, so safe to call again if the viewer ever
+// remounts its shadow root.
+function ensureTopBarGap(root: ShadowRoot): void {
+  const GAP_STYLE_ID = 'pwv-topbar-gap-style';
+  if (root.getElementById(GAP_STYLE_ID)) return;
+  const style = document.createElement('style');
+  style.id = GAP_STYLE_ID;
+  style.textContent =
+    '#pwv-header-top { padding-right: 3.5rem !important; box-sizing: border-box !important; }' +
+    '#pwv-header-bottom-mobile-tools { margin-right: 3rem !important; }' +
+    '.pwv-search-wrapper { right: 3rem !important; width: calc(100% - 3rem) !important; }';
+  root.appendChild(style);
+}
+
 // Heuristic modal detector: we have no documented open/close API from the
 // vendor viewer, so watch for a `position: fixed`/`absolute` descendant large
 // enough to be a dialog backdrop (its own modals cover most of the viewport)
@@ -863,6 +906,8 @@ function initEditor(initialFile?: File): Promise<ViewerResult> {
         await saveFileBytes(bytes, _currentFilePath || file.name);
       },
     });
+    const wrapperShadowRoot = (result as any).ui?.pdfWebElement?.shadowRoot as ShadowRoot | undefined;
+    if (wrapperShadowRoot) ensureTopBarGap(wrapperShadowRoot);
     const svc = (result as any).ui?.pdfWebService;
     // documentOpened$ fires when a document is fully loaded — single authoritative subscription.
     // Handles all subsequent display_pdf calls; the first open is handled separately below.
