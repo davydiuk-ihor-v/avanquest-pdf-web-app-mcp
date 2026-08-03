@@ -773,9 +773,33 @@ let editorReady: Promise<ViewerResult> | null = null;
 // the host reports our real allocated size asynchronously (after PdfEditor()
 // is already constructed), and that initial fit-zoom never recomputes once
 // our container grows. Force a sane, predictable 100% zoom right after each
-// document loads instead of trusting the auto-fit.
-function resetZoomTo100(docVm: any): void {
+// document loads instead of trusting the auto-fit. Also force single-page
+// layout (RDB-7720) instead of the vendor's continuous-scroll default.
+function applyDefaultViewSettings(docVm: any): void {
+  // setLayout first: switching layout mode can reset the page-view fit mode
+  // back to its own default, so it must not run after — and thereby undo —
+  // the actual-size + forced zoom below.
+  try { docVm?.setLayout?.('single'); } catch (_) { /* non-fatal */ }
+  // Single-page layout renders through an auto-fit page view (fit-page /
+  // fit-width) that recomputes against the container size — the same
+  // "tiny container at construction time" problem this function's zoom
+  // override already exists to work around, just on a different axis.
+  // actualSize tells the viewer to honor our explicit zoom instead of
+  // auto-fitting, otherwise setZoom() below is silently ignored.
+  try { docVm?.setPageView?.('actual-size'); } catch (_) { /* non-fatal */ }
   try { docVm?.setZoom?.(1); } catch (_) { /* non-fatal */ }
+  // TEMP diagnostics (RDB-7720): confirm this build is actually running and
+  // capture whether zoom/pageView/layout get silently overridden shortly
+  // after we set them. Remove once the tiny-page-render bug is understood.
+  const snapshot = (label: string) => {
+    try {
+      beacon(`RDB-7720 diag [${label}]: layout=${docVm?.getLayout?.()} pageView=${docVm?.getPageView?.()} zoom=${docVm?.getZoom?.()} container=${viewerEl.clientWidth}x${viewerEl.clientHeight}`);
+    } catch (err) { beacon(`RDB-7720 diag [${label}] failed: ${(err as Error).message}`); }
+  };
+  snapshot('t+0ms');
+  setTimeout(() => snapshot('t+300ms'), 300);
+  setTimeout(() => snapshot('t+1000ms'), 1000);
+  setTimeout(() => snapshot('t+3000ms'), 3000);
 }
 
 // Mount the viewer once. `initialFile`, when given, is opened by the viewer as
@@ -823,6 +847,15 @@ function initEditor(initialFile?: File): Promise<ViewerResult> {
             print: false,
           },
         },
+        navigationBar: {
+          enabled: true,
+          controls: {
+            pageNavigationButtons: true,
+            pageNumberInput: true,
+            viewSelectButton: false,
+            downloadButton: false,
+          },
+        },
       },
       ...(initialFile ? { initialDocument: { file: initialFile } } : {}),
       onDownloadFile: async (file: File) => {
@@ -835,14 +868,14 @@ function initEditor(initialFile?: File): Promise<ViewerResult> {
     // Handles all subsequent display_pdf calls; the first open is handled separately below.
     svc?.documentOpened$?.subscribe?.((docVm: any) => {
       _currentDocumentView = docVm;
-      resetZoomTo100(docVm);
+      applyDefaultViewSettings(docVm);
       // Resolve the pending openPdf() Promise so commands are unblocked.
       if (_resolveDocOpen) { const r = _resolveDocOpen; _resolveDocOpen = null; r(); }
       // Notify server that the new document is ready (clears _pendingDocOpen gate).
       (app as any).callServerTool({ name: 'report_viewer_result', arguments: { type: 'doc_opened' } }).catch(() => {});
     });
     const initial = svc?.getActiveDocumentViewElement?.()?.documentView;
-    if (initial) { _currentDocumentView = initial; resetZoomTo100(initial); }
+    if (initial) { _currentDocumentView = initial; applyDefaultViewSettings(initial); }
 
     statusEl.style.display = 'none';
     return result;
@@ -903,7 +936,7 @@ async function openPdf(token: string, name: string, filePath?: string): Promise<
   } catch { /* timeout or open error — proceed with whatever document is active */ }
   // After openDocument resolves, read the active document directly.
   const activeVm = svc?.getActiveDocumentViewElement?.()?.documentView;
-  if (activeVm) { _currentDocumentView = activeVm; resetZoomTo100(activeVm); }
+  if (activeVm) { _currentDocumentView = activeVm; applyDefaultViewSettings(activeVm); }
   // Unblock the server-side command gate.
   (app as any).callServerTool({ name: 'report_viewer_result', arguments: { type: 'doc_opened' } }).catch(() => {});
   statusEl.style.display = 'none';
