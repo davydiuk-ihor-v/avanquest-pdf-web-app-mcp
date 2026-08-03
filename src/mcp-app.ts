@@ -387,17 +387,15 @@ async function bootstrapWorker(worker: Worker, dir: string): Promise<void> {
   });
   try {
     // dir is an absolute URL on the asset server; the /mod/ channel wants the
-    // server-relative path (e.g. "public/pwv-workers/").
+    // server-relative path (e.g. "public/pwv-workers/"). We request the
+    // stable, unhashed alias names — the server resolves each to whatever
+    // hashed pdfworker-<hash>.{js,wasm,data} file the installed package
+    // actually ships (see the /mod/ route in server.ts), so this needs no
+    // update when the package's asset hashes change.
     const rel = new URL(dir).pathname.replace(/^\//, '');
-    let manifest: Record<string, string> = {};
-    try {
-      manifest = JSON.parse(new TextDecoder().decode(await loadBytes(rel + 'manifest.json')));
-    } catch {
-      // fall back to unhashed names
-    }
-    const jsFile = manifest['pdfworker.js'] ?? 'pdfworker.js';
-    const wasmFile = manifest['pdfworker.wasm'] ?? 'pdfworker.wasm';
-    const dataFile = manifest['pdfworker.data'] ?? 'pdfworker.data';
+    const jsFile = 'pdfworker.js';
+    const wasmFile = 'pdfworker.wasm';
+    const dataFile = 'pdfworker.data';
     beacon(`worker bootstrap: loading ${jsFile}, ${wasmFile}, ${dataFile} from /mod/${rel}`);
     const [codeBytes, pkgBytes, wasmBytes] = await Promise.all([
       loadBytes(rel + jsFile),
@@ -797,10 +795,8 @@ function initEditor(initialFile?: File): Promise<ViewerResult> {
     const result = await PdfEditor({
       container: viewerEl,
       license,
-      workerPath: `${base}public/pwv-workers/`,
-      fontsPath: `${base}public/pwv-fonts/`,
-      i18nPath: `${base}public/pwv-i18n/`,
-      stampsPath: `${base}public/pwv-stamps/`,
+      basePath: `${base}public`,
+      openDocumentsInNewTab: false,
       layoutConfig: {
         header: {
           activeTab: 'edit',
