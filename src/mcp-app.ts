@@ -864,7 +864,17 @@ let editorReady: Promise<ViewerResult> | null = null;
 // our container grows. Force a sane, predictable 100% zoom right after each
 // document loads instead of trusting the auto-fit. Also force single-page
 // layout (RDB-7720) instead of the vendor's continuous-scroll default.
+// Bounded window (ms) during which we fight the vendor's own auto-fit
+// recompute on every container resize (see applyDefaultViewSettings below).
+// Past this we stop, so a manual zoom the user makes later isn't fought.
+const ZOOM_FIX_WINDOW_MS = 15_000;
+let _zoomFixObserver: ResizeObserver | null = null;
+
 function applyDefaultViewSettings(docVm: any): void {
+  // A new document replaces whichever one the previous observer was
+  // guarding — stop it so it doesn't keep correcting a stale docVm.
+  _zoomFixObserver?.disconnect();
+
   // setLayout first: switching layout mode can reset the page-view fit mode
   // back to its own default, so it must not run after — and thereby undo —
   // the actual-size + forced zoom below.
@@ -875,20 +885,26 @@ function applyDefaultViewSettings(docVm: any): void {
   // override already exists to work around, just on a different axis.
   // actualSize tells the viewer to honor our explicit zoom instead of
   // auto-fitting, otherwise setZoom() below is silently ignored.
-  try { docVm?.setPageView?.('actual-size'); } catch (_) { /* non-fatal */ }
-  try { docVm?.setZoom?.(1); } catch (_) { /* non-fatal */ }
-  // TEMP diagnostics (RDB-7720): confirm this build is actually running and
-  // capture whether zoom/pageView/layout get silently overridden shortly
-  // after we set them. Remove once the tiny-page-render bug is understood.
-  const snapshot = (label: string) => {
-    try {
-      beacon(`RDB-7720 diag [${label}]: layout=${docVm?.getLayout?.()} pageView=${docVm?.getPageView?.()} zoom=${docVm?.getZoom?.()} container=${viewerEl.clientWidth}x${viewerEl.clientHeight}`);
-    } catch (err) { beacon(`RDB-7720 diag [${label}] failed: ${(err as Error).message}`); }
+  const forceActualSizeZoom = () => {
+    try { docVm?.setPageView?.('actual-size'); } catch (_) { /* non-fatal */ }
+    try { docVm?.setZoom?.(1); } catch (_) { /* non-fatal */ }
   };
-  snapshot('t+0ms');
-  setTimeout(() => snapshot('t+300ms'), 300);
-  setTimeout(() => snapshot('t+1000ms'), 1000);
-  setTimeout(() => snapshot('t+3000ms'), 3000);
+  forceActualSizeZoom();
+
+  // The host reports our real allocated container size asynchronously, and
+  // the vendor's own auto-fit recomputes against it once that lands —
+  // silently reverting the actual-size + 100% zoom forced above (RDB-7720).
+  // How long that takes varies with document/asset size (a fixed handful of
+  // setTimeout retries missed it for larger documents), so react to the
+  // actual resize instead of guessing delays: re-apply on every #viewer
+  // resize for a bounded window after open, which also covers the initial
+  // size ResizeObserver reports immediately upon observe().
+  const deadline = Date.now() + ZOOM_FIX_WINDOW_MS;
+  _zoomFixObserver = new ResizeObserver(() => {
+    if (Date.now() > deadline) { _zoomFixObserver?.disconnect(); return; }
+    forceActualSizeZoom();
+  });
+  _zoomFixObserver.observe(viewerEl);
 }
 
 // Mount the viewer once. `initialFile`, when given, is opened by the viewer as
