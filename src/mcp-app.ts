@@ -665,11 +665,17 @@ function collectAllElements(root: Element | ShadowRoot, out: Element[]): void {
 // #fullscreen-btn's `right` offset in mcp-app.html).
 //
 // Below a 1024px container width the vendor's own `@container` query hides
-// #pwv-header-top entirely and relocates that same search/zoom/view-options
-// cluster into #pwv-header-bottom-mobile-tools (a totally different element,
-// rendered as the sole visible row at narrow widths) with only a 0.25rem
-// margin — not enough to clear our button either, so it needs the same
-// treatment.
+// #pwv-header-top entirely and #pwv-header-bottom becomes the sole visible
+// row, with its own right-aligned group (#pwv-header-bottom-right: the
+// relocated search/zoom cluster, the Download button, and — conditionally —
+// the translate/e-sign action containers) packed flush against the true
+// right edge via `justify-content: flex-end`. Padding the *last* child
+// (tried #pwv-header-bottom-mobile-tools first) only adds a gap between it
+// and its next sibling — flex-end packs the group as a unit against the
+// container's edge regardless, so whichever child ends up last (Download,
+// normally) still sits under our button. #pwv-header-bottom itself has the
+// same padding/space-between shape as #pwv-header-top, so pad it the same
+// way to shift the whole group left at once.
 //
 // The search panel (.pwv-search-wrapper, opened via the loop/search icon) is
 // yet a third, independent case: it's `position: absolute; right: 0.375rem`,
@@ -691,7 +697,7 @@ function ensureTopBarGap(root: ShadowRoot): void {
   style.id = GAP_STYLE_ID;
   style.textContent =
     '#pwv-header-top { padding-right: 3.5rem !important; box-sizing: border-box !important; }' +
-    '#pwv-header-bottom-mobile-tools { margin-right: 3rem !important; }' +
+    '#pwv-header-bottom { padding-right: 3.5rem !important; box-sizing: border-box !important; }' +
     '.pwv-search-wrapper { right: 3rem !important; width: calc(100% - 3rem) !important; }';
   root.appendChild(style);
 }
@@ -904,8 +910,7 @@ function initEditor(initialFile?: File): Promise<ViewerResult> {
       license,
       basePath: `${base}public`,
       openDocumentsInNewTab: false,
-      layoutConfig: {
-        header: {
+      layoutConfig: {        header: {
           activeTab: 'edit',
           tabs: {
             list: {
@@ -936,7 +941,7 @@ function initEditor(initialFile?: File): Promise<ViewerResult> {
             pageNavigationButtons: true,
             pageNumberInput: true,
             viewSelectButton: false,
-            downloadButton: false,
+            downloadButton: true,
           },
         },
       },
