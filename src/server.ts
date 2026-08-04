@@ -561,6 +561,7 @@ async function main(): Promise<void> {
       const token = mintToken(absolutePath, name, isTemp);
       const fileUrl = `${baseUrl}/file/${token}`;
       _lastDocState = '';
+      _lastWorkingFile = '';
       _pendingDocOpen = true;
       pendingViewerCommand = null;
 
@@ -831,7 +832,15 @@ async function main(): Promise<void> {
   // Tracks last-known document state injected by mcp-app.ts via report_viewer_result.
   // Appended to every viewer tool response so Claude always knows pageCount after each op.
   let _lastDocState = '';
-  function docNote(): string { return _lastDocState ? ` [${_lastDocState}]` : ''; }
+  // RDB-7843: path of the single persistent working copy (<name>_updated.pdf)
+  // mcp-app.ts auto-saves edits into, injected the same way as _lastDocState.
+  // Surfacing it on every edit response (not just save_pdf's own) means Claude
+  // never needs a separate "where did this get saved" round trip.
+  let _lastWorkingFile = '';
+  function docNote(): string {
+    const parts = [_lastDocState, _lastWorkingFile ? `saved to ${_lastWorkingFile}` : ''].filter(Boolean);
+    return parts.length ? ` [${parts.join(' — ')}]` : '';
+  }
 
   // Fullscreen arbitration across sibling widget iframes. Each display_pdf/etc.
   // widget renders in its own iframe on its own ephemeral sandbox origin, so
@@ -2413,6 +2422,16 @@ async function main(): Promise<void> {
         _pendingDocOpen = false;
       } else if (type === 'search') {
         pendingSearchResult = { count: count ?? 0, pages: pages ?? [] };
+      } else if (type === 'auto_save') {
+        // RDB-7843: a side-channel note from the isModified-driven safety-net
+        // save (mcp-app.ts's watchDocumentModifications) — not a poll target
+        // for any pending tool call, so it must bypass pendingViewerResult:
+        // overwriting that here could clobber a same-tick result some other
+        // in-flight pollViewerResult() is still waiting to see.
+        try {
+          const parsed = json ? JSON.parse(json) : null;
+          if (parsed?.path) _lastWorkingFile = parsed.path;
+        } catch { /* ignore malformed note */ }
       } else if (json !== undefined) {
         try {
           const parsed = JSON.parse(json);
@@ -2420,6 +2439,7 @@ async function main(): Promise<void> {
             const cp = parsed._currentPage != null ? `page ${parsed._currentPage} of ` : '';
             _lastDocState = `${cp}${parsed._pageCount} pages`;
           }
+          if (parsed._workingFile) _lastWorkingFile = parsed._workingFile;
           pendingViewerResult = { type, data: parsed };
         } catch {
           pendingViewerResult = { type, data: json };

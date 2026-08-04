@@ -506,8 +506,23 @@ const app = new App(
   { name: 'Avanquest PDF Viewer', version: '0.4.0' },
   { availableDisplayModes: ['inline', 'fullscreen'] },
 );
-// Intercept report_viewer_result to automatically inject current doc state (_pageCount, _currentPage).
-// This gives the server fresh page count after every operation so Claude doesn't work with stale state.
+// RDB-7843: command types that mutate the document — after any of these
+// reports success, we auto-save the single persistent working copy (see
+// autoSaveWorkingCopy below) and stamp its path onto the same report rather
+// than touching each of these ~30 handlers individually.
+const MUTATING_COMMAND_TYPES = new Set([
+  'rotate_pages', 'insert_blank_page', 'add_image_to_page', 'add_annotation', 'circle_text',
+  'update_annotation', 'delete_annotation', 'replace_text', 'add_bookmark', 'delete_bookmark',
+  'delete_all_bookmarks', 'resize_pages', 'delete_pages', 'move_pages', 'duplicate_pages',
+  'reverse_pages', 'undo', 'redo', 'update_document_properties', 'update_form_field',
+  'apply_redactions', 'delete_bates_numbering', 'delete_watermark', 'delete_header',
+  'delete_page_number', 'insert_page_number', 'delete_text_blocks', 'set_security_permissions',
+  'search_and_redact', 'format_text', 'add_text_to_page', 'add_form_field', 'format_selected_text',
+]);
+
+// Intercept report_viewer_result to automatically inject current doc state (_pageCount, _currentPage)
+// and, for mutating commands, the working-copy path (_workingFile — RDB-7843). This gives the server
+// fresh page count and save location after every operation so Claude doesn't work with stale state.
 {
   const _orig = (app as any).callServerTool.bind(app);
   (app as any).callServerTool = async (params: { name: string; arguments: Record<string, unknown> }) => {
@@ -515,11 +530,21 @@ const app = new App(
       try {
         const doc = (_currentDocumentView as any)?.getDocument?.();
         const pages = doc?.getPages?.() as unknown[] | undefined;
-        if (pages) {
-          const parsed = JSON.parse(params.arguments.json as string);
-          parsed._pageCount = pages.length;
-          const idx = (_currentDocumentView as any)?.getCurrentPageIndex?.();
-          if (typeof idx === 'number') parsed._currentPage = idx + 1;
+        let parsed: any = null;
+        if (typeof params.arguments.json === 'string') {
+          try { parsed = JSON.parse(params.arguments.json as string); } catch { /* leave null, nothing to augment */ }
+        }
+        if (parsed) {
+          if (pages) {
+            parsed._pageCount = pages.length;
+            const idx = (_currentDocumentView as any)?.getCurrentPageIndex?.();
+            if (typeof idx === 'number') parsed._currentPage = idx + 1;
+          }
+          const reportType = params.arguments.type as string | undefined;
+          if (reportType && MUTATING_COMMAND_TYPES.has(reportType) && parsed.success !== false) {
+            const savedPath = await autoSaveWorkingCopy();
+            if (savedPath) parsed._workingFile = savedPath;
+          }
           params = { ...params, arguments: { ...params.arguments, json: JSON.stringify(parsed) } };
         }
       } catch { /* non-fatal — send original if state unavailable */ }
@@ -874,6 +899,7 @@ function applyDefaultViewSettings(docVm: any): void {
   // A new document replaces whichever one the previous observer was
   // guarding — stop it so it doesn't keep correcting a stale docVm.
   _zoomFixObserver?.disconnect();
+  watchDocumentModifications(docVm);
 
   // setLayout first: switching layout mode can reset the page-view fit mode
   // back to its own default, so it must not run after — and thereby undo —
@@ -1052,7 +1078,7 @@ const COMPRESS_QUALITY: Record<string, number> = {
   max: 0.15, high: 0.25, medium: 0.5, low: 0.75, min: 1.0,
 };
 
-async function saveChunked(bytes: Uint8Array, targetPath: string, label = 'Saving'): Promise<void> {
+async function saveChunked(bytes: Uint8Array, targetPath: string, label = 'Saving', silent = false): Promise<void> {
   const totalSize = bytes.length;
   let offset = 0;
   while (offset < totalSize) {
@@ -1064,8 +1090,85 @@ async function saveChunked(bytes: Uint8Array, targetPath: string, label = 'Savin
       arguments: { token: _currentToken, savePath: targetPath, chunk: btoa(bin), offset, totalSize },
     });
     offset += chunk.length;
-    showSaveProgress(label, (offset / totalSize) * 100);
+    if (!silent) showSaveProgress(label, (offset / totalSize) * 100);
   }
+}
+
+// RDB-7843: after every edit, silently re-export the current document into a
+// single persistent working copy (<original name>_updated.pdf, next to the
+// original) instead of leaving edits unsaved in memory or writing a fresh
+// file per action. Re-derives/reuses _workingFilePath per open document —
+// reset alongside _currentFilePath wherever a (different) file becomes
+// current (see those assignment sites).
+let _workingFilePath: string | null = null;
+
+function getWorkingFilePath(): string | null {
+  if (!_currentFilePath) return null;
+  if (_workingFilePath) return _workingFilePath;
+  const dot = _currentFilePath.lastIndexOf('.');
+  const base = dot > -1 ? _currentFilePath.slice(0, dot) : _currentFilePath;
+  const ext = dot > -1 ? _currentFilePath.slice(dot) : '.pdf';
+  // If the file the user opened is already a working copy from a previous
+  // session (e.g. they reopened "foo_updated.pdf" directly), keep saving
+  // into that same file instead of chaining another "_updated" onto it.
+  _workingFilePath = base.endsWith('_updated') ? _currentFilePath : `${base}_updated${ext}`;
+  return _workingFilePath;
+}
+
+async function autoSaveWorkingCopy(): Promise<string | null> {
+  const targetPath = getWorkingFilePath();
+  if (!targetPath) return null;
+  try {
+    const doc = (_currentDocumentView as any)?.getDocument?.();
+    if (!doc) return null;
+    const raw = await doc.exportDocument({ as: 'uint8array' });
+    const bytes = new Uint8Array(raw instanceof ArrayBuffer ? raw : (raw as ArrayBufferView).buffer);
+    await saveChunked(bytes, targetPath, 'Auto-saving', /* silent */ true);
+    return targetPath;
+  } catch (err) {
+    beacon(`auto-save working copy failed: ${(err as Error).message}`);
+    return null;
+  }
+}
+
+// RDB-7843 safety net: MUTATING_COMMAND_TYPES only catches edits driven by our
+// own chat-issued commands. A user editing the document directly through the
+// vendor viewer's own UI (dragging an annotation, typing in a form field,
+// clicking its built-in rotate button, ...) never goes through that command
+// path at all, so it needs an independent signal. `getDocument().onIsModified
+// Changed` is backed by the shared undo/redo history and fires for ANY edit
+// regardless of origin (confirmed against the SDK source) -- including our
+// own commands, hence the debounce so a chat-driven edit doesn't trigger two
+// exports back-to-back with the command-type-based save above.
+let _autoSaveDebounceTimer: ReturnType<typeof setTimeout> | undefined;
+function scheduleDebouncedAutoSave(): void {
+  if (_autoSaveDebounceTimer !== undefined) clearTimeout(_autoSaveDebounceTimer);
+  _autoSaveDebounceTimer = setTimeout(async () => {
+    _autoSaveDebounceTimer = undefined;
+    const savedPath = await autoSaveWorkingCopy();
+    if (savedPath) {
+      // Not a poll target for any pending tool call -- a side-channel note
+      // the server folds into whichever tool response comes next (see
+      // report_viewer_result's 'auto_save' handling in server.ts).
+      await (app as any).callServerTool({
+        name: 'report_viewer_result',
+        arguments: { type: 'auto_save', json: JSON.stringify({ success: true, path: savedPath }) },
+      }).catch(() => {});
+    }
+  }, 800);
+}
+
+let _isModifiedSub: { unsubscribe: () => void } | null = null;
+function watchDocumentModifications(docVm: any): void {
+  _isModifiedSub?.unsubscribe();
+  _isModifiedSub = null;
+  try {
+    const doc = docVm?.getDocument?.();
+    const sub = doc?.onIsModifiedChanged?.subscribe?.((isModified: boolean) => {
+      if (isModified) scheduleDebouncedAutoSave();
+    });
+    if (sub) _isModifiedSub = sub;
+  } catch (_) { /* non-fatal — the command-type-based save still covers chat-driven edits */ }
 }
 
 function startViewerCommandPoller(): void {
@@ -1292,6 +1395,14 @@ async function handleRotatePages(data: { angle: number; pages: number[] | null }
     applyContainerHeight(null);
     show(`Rotated ${range.length} page(s) by ${data.angle}°`);
     setTimeout(() => { statusEl.style.display = 'none'; }, 3000);
+    // rotate_pages responds to Claude immediately (fire-and-forget on the server
+    // side), so this report can't affect that tool's own reply — but it still
+    // feeds the shared _pageCount/_workingFile tracking (RDB-7843) that the
+    // *next* tool call's response will include.
+    await (app as any).callServerTool({
+      name: 'report_viewer_result',
+      arguments: { type: 'rotate_pages', json: JSON.stringify({ success: true }) },
+    }).catch(() => {});
   } catch (err) {
     show(`Rotate error: ${err instanceof Error ? err.message : String(err)}`, true);
   }
@@ -1328,6 +1439,11 @@ async function handleInsertBlankPage(data: { afterPage: number | null }): Promis
       : `after page ${index}`;
     show(`Inserted blank page ${where}`);
     setTimeout(() => { statusEl.style.display = 'none'; }, 3000);
+    // See handleRotatePages above: feeds RDB-7843 tracking for the next tool call.
+    await (app as any).callServerTool({
+      name: 'report_viewer_result',
+      arguments: { type: 'insert_blank_page', json: JSON.stringify({ success: true }) },
+    }).catch(() => {});
   } catch (err) {
     show(`Insert page error: ${err instanceof Error ? err.message : String(err)}`, true);
   }
@@ -1422,6 +1538,11 @@ async function handleAddImageToPage(data: {
 
     show(`Image added to page ${data.page}`);
     setTimeout(() => { statusEl.style.display = 'none'; }, 3000);
+    // See handleRotatePages above: feeds RDB-7843 tracking for the next tool call.
+    await (app as any).callServerTool({
+      name: 'report_viewer_result',
+      arguments: { type: 'add_image_to_page', json: JSON.stringify({ success: true }) },
+    }).catch(() => {});
   } catch (err) {
     show(`Add image error: ${err instanceof Error ? err.message : String(err)}`, true);
   }
@@ -1478,6 +1599,11 @@ async function handleAddAnnotation(data: AnnotationCommand): Promise<void> {
     await (doc as any).createAnnotation({ pageIndex, params });
     show(`Added ${data.shape} on page ${data.page}`);
     setTimeout(() => { statusEl.style.display = 'none'; }, 3000);
+    // See handleRotatePages above: feeds RDB-7843 tracking for the next tool call.
+    await (app as any).callServerTool({
+      name: 'report_viewer_result',
+      arguments: { type: 'add_annotation', json: JSON.stringify({ success: true }) },
+    }).catch(() => {});
   } catch (err) {
     show(`Annotation error: ${err instanceof Error ? err.message : String(err)}`, true);
   }
@@ -1694,6 +1820,9 @@ async function handleCloseDocument(): Promise<void> {
     _currentDocumentView = null;
     _currentToken = '';
     _currentFilePath = '';
+    _workingFilePath = null;
+    _isModifiedSub?.unsubscribe();
+    _isModifiedSub = null;
     _searchRanges = [];
     _searchRects = [];
     _searchDocumentView = null;
@@ -3017,6 +3146,7 @@ async function handleSaveAs(data: { outputPath: string | null; fileName: string 
     }
     await saveChunked(bytes, targetPath, 'Saving copy');
     _currentFilePath = targetPath;
+    _workingFilePath = null; // "Save As" makes targetPath the new original — start a fresh working copy from it
     showSaveSuccess('PDF saved successfully', targetPath);
     await (app as any).callServerTool({
       name: 'report_viewer_result',
@@ -3493,6 +3623,7 @@ async function handleMerge(files: Array<{ token: string; name: string }>, output
     beacon(`merge done: ${merged.length} bytes → ${outputPath}`);
     await saveChunked(merged, outputPath, 'Saving merged PDF');
     _currentFilePath = outputPath;
+    _workingFilePath = null; // merge produces a new original — start a fresh working copy from it
     showSaveSuccess('PDFs merged successfully', outputPath);
   } catch (err) {
     showSaveError(`Merge failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -3586,6 +3717,7 @@ app.ontoolresult = async (result) => {
     const token = data.token;
     _currentToken = data.token;
     _currentFilePath = data.filePath ?? '';
+    _workingFilePath = null; // new document open — start a fresh working copy derived from this path
     _openingDocument = openPdf(data.token, data.name, data.filePath).then(async () => {
       try {
         if (await shouldAutoFullscreen(token)) {
