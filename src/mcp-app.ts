@@ -1108,7 +1108,10 @@ function getWorkingFilePath(): string | null {
   const dot = _currentFilePath.lastIndexOf('.');
   const base = dot > -1 ? _currentFilePath.slice(0, dot) : _currentFilePath;
   const ext = dot > -1 ? _currentFilePath.slice(dot) : '.pdf';
-  _workingFilePath = `${base}_updated${ext}`;
+  // If the file the user opened is already a working copy from a previous
+  // session (e.g. they reopened "foo_updated.pdf" directly), keep saving
+  // into that same file instead of chaining another "_updated" onto it.
+  _workingFilePath = base.endsWith('_updated') ? _currentFilePath : `${base}_updated${ext}`;
   return _workingFilePath;
 }
 
