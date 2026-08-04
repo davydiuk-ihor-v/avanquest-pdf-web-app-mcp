@@ -1172,8 +1172,18 @@ function watchDocumentModifications(docVm: any): void {
 }
 
 function startViewerCommandPoller(): void {
+  // RDB-7842: setInterval fires on a fixed clock regardless of whether the
+  // previous tick's async callback has finished — a slow command (SDK call,
+  // or the RDB-7843 auto-save export+upload after every edit) left multiple
+  // ticks running concurrently against the same _currentDocumentView, racing
+  // each other. That's a very plausible source of "PDF stops responding
+  // after several operations" and the resulting server-side poll timeout.
+  // A single in-flight guard serializes ticks so only one command is ever
+  // processed at a time.
+  let processing = false;
   setInterval(async () => {
-    if (!editorReady) return;
+    if (!editorReady || processing) return;
+    processing = true;
     try {
       const result = await (app as any).callServerTool({ name: 'get_viewer_command', arguments: {} });
       const { command } = JSON.parse((result.content[0] as { text: string }).text) as { command: Record<string, unknown> | null };
@@ -1378,7 +1388,11 @@ function startViewerCommandPoller(): void {
           strikeout_color: command.strikeout_color as string | undefined,
         });
       }
-    } catch (_) {}
+    } catch (_) {
+      /* swallow — individual handlers already report their own errors via show()/report_viewer_result */
+    } finally {
+      processing = false;
+    }
   }, 800);
 }
 
