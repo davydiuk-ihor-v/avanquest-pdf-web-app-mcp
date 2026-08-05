@@ -164,6 +164,14 @@ const fileTokens = new Map<string, FileEntry>();
 const saveBuffers = new Map<string, Buffer[]>();
 const TOKEN_TTL_MS = 30 * 60 * 1000;
 
+// Appended to edit-tool descriptions so the model doesn't paraphrase away the
+// save-location note docNote() attaches to the response text — observed in
+// practice: Claude reliably relayed a concrete "saved to <path>" note, but
+// silently dropped the more abstract "a working copy will be created" note
+// on a document's very first edit, treating it as internal plumbing rather
+// than something to tell the user.
+const RELAY_SAVE_NOTE_INSTRUCTION = ' IMPORTANT: the response includes a bracketed note about where this change was saved (or that a working copy will be created) -- always relay that note to the user, even if it says a working copy is about to be created rather than a concrete path.';
+
 function pruneExpired(): void {
   const now = Date.now();
   for (const [token, entry] of fileTokens) {
@@ -837,8 +845,30 @@ async function main(): Promise<void> {
   // Surfacing it on every edit response (not just save_pdf's own) means Claude
   // never needs a separate "where did this get saved" round trip.
   let _lastWorkingFile = '';
-  function docNote(): string {
-    const parts = [_lastDocState, _lastWorkingFile ? `saved to ${_lastWorkingFile}` : ''].filter(Boolean);
+  // Mirrors mcp-app.ts's MUTATING_COMMAND_TYPES — the report_viewer_result
+  // `type` values that represent an actual document edit (as opposed to a
+  // read, like get_view_state or read_annotations, which also round-trip
+  // through report_viewer_result but never touch _lastWorkingFile). Used so
+  // docNote() only ever mentions saving/working-copy behavior for edits.
+  const MUTATING_RESULT_TYPES = new Set([
+    'rotate_pages', 'insert_blank_page', 'add_image_to_page', 'add_annotation', 'circle_text',
+    'update_annotation', 'delete_annotation', 'replace_text', 'add_bookmark', 'delete_bookmark',
+    'delete_all_bookmarks', 'resize_pages', 'delete_pages', 'move_pages', 'duplicate_pages',
+    'reverse_pages', 'undo', 'redo', 'update_document_properties', 'update_form_field',
+    'apply_redactions', 'delete_bates_numbering', 'delete_watermark', 'delete_header',
+    'delete_page_number', 'insert_page_number', 'delete_text_blocks', 'set_security_permissions',
+    'search_and_redact', 'format_text', 'add_text_to_page', 'add_form_field', 'format_selected_text',
+  ]);
+  function docNote(isEdit = false): string {
+    // The very first edit in a document's lifetime fires before the
+    // debounced auto-save (mcp-app.ts) has ever completed once, so there's
+    // no working-copy path to report yet — say so anyway instead of silently
+    // omitting any save-related note, so Claude/the user aren't left
+    // wondering whether the change was persisted at all.
+    const savedNote = _lastWorkingFile
+      ? `saved to ${_lastWorkingFile}`
+      : (isEdit ? 'a working copy of this file will be created and used for all further edits' : '');
+    const parts = [_lastDocState, savedNote].filter(Boolean);
     return parts.length ? ` [${parts.join(' — ')}]` : '';
   }
 
@@ -881,7 +911,7 @@ async function main(): Promise<void> {
         pendingViewerResult = null;
         const result = handler(pr.data as T);
         if (!result.isError && result.content[0]) {
-          result.content[0] = { type: 'text' as const, text: result.content[0].text + docNote() };
+          result.content[0] = { type: 'text' as const, text: result.content[0].text + docNote(MUTATING_RESULT_TYPES.has(resultType)) };
         }
         return result;
       }
@@ -964,7 +994,7 @@ async function main(): Promise<void> {
     {
       title: 'Rotate Pages',
       annotations: { readOnlyHint: false, destructiveHint: false },
-      description: 'Rotate pages in the currently open PDF viewer. Use pages for specific 1-based page numbers (e.g. [1,3]), or omit to rotate all pages. Angle: 90, 180, or 270.',
+      description: 'Rotate pages in the currently open PDF viewer. Use pages for specific 1-based page numbers (e.g. [1,3]), or omit to rotate all pages. Angle: 90, 180, or 270.' + RELAY_SAVE_NOTE_INSTRUCTION,
       inputSchema: {
         angle: z.union([z.literal(90), z.literal(180), z.literal(270)]).describe('Rotation angle in degrees (90, 180, or 270)'),
         pages: z.array(z.number().int().min(1)).optional().describe('1-based page numbers to rotate. Omit to rotate all pages.'),
@@ -973,7 +1003,7 @@ async function main(): Promise<void> {
     async ({ angle, pages }) => {
       pendingViewerCommand = { type: 'rotate_pages', angle, pages: pages ?? null };
       return {
-        content: [{ type: 'text' as const, text: `Rotating ${pages ? `pages ${pages.join(',')}` : 'all pages'} by ${angle}Â°` }],
+        content: [{ type: 'text' as const, text: `Rotating ${pages ? `pages ${pages.join(',')}` : 'all pages'} by ${angle}°${docNote(true)}` }],
       };
     },
   );
@@ -983,7 +1013,7 @@ async function main(): Promise<void> {
     {
       title: 'Add Annotation',
       annotations: { readOnlyHint: false, destructiveHint: false },
-      description: 'Add a NEW shape annotation to the PDF. Use only for creating new annotations. To change color/opacity of an existing annotation, use update_annotation instead -- never delete and re-add just to change a property. Supported shapes: oval, rectangle, rhombus, line, arrow. Position and size are percentages of page dimensions (0--100).',
+      description: 'Add a NEW shape annotation to the PDF. Use only for creating new annotations. To change color/opacity of an existing annotation, use update_annotation instead -- never delete and re-add just to change a property. Supported shapes: oval, rectangle, rhombus, line, arrow. Position and size are percentages of page dimensions (0--100).' + RELAY_SAVE_NOTE_INSTRUCTION,
       inputSchema: {
         shape: z.enum(['oval', 'rectangle', 'rhombus', 'line', 'arrow']).describe('Shape type to draw'),
         page: z.number().int().min(1).describe('1-based page number to draw on'),
@@ -1002,7 +1032,7 @@ async function main(): Promise<void> {
         color: color ?? null, fillColor: fillColor ?? null, borderWidth: borderWidth ?? null,
       };
       return {
-        content: [{ type: 'text' as const, text: `Adding ${shape} on page ${page} at (${x}%, ${y}%) size ${width}%Ã--${height}%` }],
+        content: [{ type: 'text' as const, text: `Adding ${shape} on page ${page} at (${x}%, ${y}%) size ${width}%×${height}%${docNote(true)}` }],
       };
     },
   );
@@ -1120,7 +1150,7 @@ async function main(): Promise<void> {
     {
       title: 'Insert Blank Page',
       annotations: { readOnlyHint: false, destructiveHint: false },
-      description: 'Insert a blank page into the currently open PDF. Use after_page: 0 to insert before the first page (new page 1), after_page: N to insert after page N, or omit after_page to append at the end.',
+      description: 'Insert a blank page into the currently open PDF. Use after_page: 0 to insert before the first page (new page 1), after_page: N to insert after page N, or omit after_page to append at the end.' + RELAY_SAVE_NOTE_INSTRUCTION,
       inputSchema: {
         after_page: z.number().int().min(0).optional()
           .describe('1-based page number to insert after. Use 0 to insert as the first page. Omit to append at the end.'),
@@ -1132,7 +1162,7 @@ async function main(): Promise<void> {
         : after_page == null ? 'at the end'
         : `after page ${after_page}`;
       return {
-        content: [{ type: 'text' as const, text: `Inserting blank page ${where}...` }],
+        content: [{ type: 'text' as const, text: `Inserting blank page ${where}...${docNote(true)}` }],
       };
     },
   );
@@ -1142,7 +1172,7 @@ async function main(): Promise<void> {
     {
       title: 'Add Image to Page',
       annotations: { readOnlyHint: false, destructiveHint: false },
-      description: 'Insert an image onto a specific page of the currently open PDF. Use image_svg for any generated/drawn image (SVG XML string -- preferred for Claude-generated graphics, no file needed). Use image_url to download from the internet, or image_path for a local file. Position (x, y) is the bottom-left corner as % of page dimensions (0--100); width is % of page width. Omit position/size to center at 50% page width.',
+      description: 'Insert an image onto a specific page of the currently open PDF. Use image_svg for any generated/drawn image (SVG XML string -- preferred for Claude-generated graphics, no file needed). Use image_url to download from the internet, or image_path for a local file. Position (x, y) is the bottom-left corner as % of page dimensions (0--100); width is % of page width. Omit position/size to center at 50% page width.' + RELAY_SAVE_NOTE_INSTRUCTION,
       inputSchema: {
         page: z.number().int().min(1).describe('1-based page number to add the image to'),
         image_svg: z.string().optional().describe('SVG XML string to render as an image. Preferred for Claude-generated graphics -- pass the full SVG markup directly, no file or base64 needed.'),
@@ -1184,7 +1214,7 @@ async function main(): Promise<void> {
       const token = mintToken(tmpPath, `image${ext}`, true);
       pendingViewerCommand = { type: 'add_image_to_page', page, token, x: x ?? null, y: y ?? null, width: width ?? null };
       return {
-        content: [{ type: 'text' as const, text: `Adding image to page ${page}...` }],
+        content: [{ type: 'text' as const, text: `Adding image to page ${page}...${docNote(true)}` }],
       };
     },
   );
