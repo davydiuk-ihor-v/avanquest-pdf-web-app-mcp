@@ -894,6 +894,16 @@ async function main(): Promise<void> {
   const ok  = (text: string): TR => ({ content: [{ type: 'text' as const, text }] });
   const nok = (text: string): TR => ({ content: [{ type: 'text' as const, text }], isError: true });
 
+  // Hard ceiling on how long pollViewerResult will wait out an in-progress
+  // document open (see below) before giving up on it entirely and letting
+  // the normal per-call timeout run its course anyway. Kept modest (not,
+  // say, 30s+) on purpose: if the widget never connects at all (e.g. a host
+  // that doesn't render ui:// resources, or a genuinely stuck/failed editor
+  // init that somehow still didn't clear _pendingDocOpen), every affected
+  // tool call pays this in full before even starting its own timeout —
+  // better to fail in ~15s than ~40s when nothing is ever going to arrive.
+  const DOC_OPEN_GRACE_CAP_MS = 15_000;
+
   async function pollViewerResult<T>(
     command: Record<string, unknown>,
     resultType: string,
@@ -902,6 +912,23 @@ async function main(): Promise<void> {
   ): Promise<TR> {
     pendingViewerResult = null;
     pendingViewerCommand = command;
+    // display_pdf returns as soon as a token is minted, well before the
+    // widget has even fetched file bytes, let alone finished PdfEditor()
+    // bootstrap (dynamic import, license check, WASM, doc load) — which can
+    // itself take a while on a cold start. Without this, a fast follow-up
+    // tool call's own timeoutMs clock ran concurrently with that bootstrap
+    // and could expire before the document ever finished opening, even
+    // though nothing was actually wrong — reported as a false "Timed out"
+    // for a document that genuinely was mid-open. Wait the open out first
+    // (capped, so a truly stuck open doesn't hang forever) so this call's
+    // own timeout budget only starts counting once there's an actual
+    // document to poll against.
+    if (_pendingDocOpen) {
+      const openDeadline = Date.now() + DOC_OPEN_GRACE_CAP_MS;
+      while (_pendingDocOpen && Date.now() < openDeadline) {
+        await new Promise<void>((r) => setTimeout(r, 300));
+      }
+    }
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       await new Promise<void>((r) => setTimeout(r, 300));

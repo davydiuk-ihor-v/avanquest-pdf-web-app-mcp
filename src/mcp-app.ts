@@ -1013,6 +1013,14 @@ function initEditor(initialFile?: File): Promise<ViewerResult> {
     return result;
   })().catch((err: unknown) => {
     show(`init failed: ${(err as Error).message}\n${(err as Error).stack ?? ''}`, true);
+    // Clear the server-side _pendingDocOpen gate even on failure. Without
+    // this, a genuinely failed/stuck editor init (bad license, WASM load
+    // failure, etc.) left that gate permanently true, and every tool call
+    // afterward would first sit through the full doc-open grace window
+    // (pollViewerResult in server.ts) before its own timeout even started --
+    // turning a fast, correct "nothing is open" failure into a much slower
+    // one for no benefit.
+    (app as any).callServerTool({ name: 'report_viewer_result', arguments: { type: 'doc_opened' } }).catch(() => {});
     throw err;
   });
   return editorReady;
