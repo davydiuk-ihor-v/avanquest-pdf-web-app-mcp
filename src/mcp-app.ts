@@ -503,7 +503,7 @@ const NativeWorker = window.Worker;
 };
 
 const app = new App(
-  { name: 'Avanquest PDF Viewer', version: '0.4.0' },
+  { name: 'Avanquest PDF Editor', version: '0.4.0' },
   { availableDisplayModes: ['inline', 'fullscreen'] },
 );
 // RDB-7843: command types that mutate the document — after any of these

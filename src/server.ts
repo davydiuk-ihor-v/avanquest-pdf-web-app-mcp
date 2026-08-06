@@ -584,7 +584,7 @@ async function main(): Promise<void> {
       title: 'Display PDF',
       annotations: { readOnlyHint: false, destructiveHint: false },
       description:
-        'Open a PDF in the embedded Avanquest PDF viewer. Pass either an absolute local path to a .pdf file inside the user\'s document folders, or a URL to a remote PDF. The viewer renders inline in the chat.',
+        'Open a PDF in the embedded Avanquest PDF editor. Pass either an absolute local path to a .pdf file inside the user\'s document folders, or a URL to a remote PDF. The viewer renders inline in the chat.',
       inputSchema: {
         path: z.string().optional().describe("Absolute path to a PDF file within the user's allowed document folders"),
         url: z.string().optional().describe('URL of a remote PDF to download and open (http or https)'),
@@ -2653,7 +2653,7 @@ async function main(): Promise<void> {
       'PWV Diagnostics',
       diagResourceUri,
       {
-        description: 'Sandbox capability diagnostics for the Avanquest PDF viewer extension.',
+        description: 'Sandbox capability diagnostics for the Avanquest PDF editor extension.',
         _meta: { ui: { csp: { resourceDomains: [baseUrl], connectDomains: [baseUrl] } } },
       },
       async () => {
@@ -2674,7 +2674,7 @@ async function main(): Promise<void> {
 
   registerAppResource(
     server,
-    'Avanquest PDF Viewer',
+    'Avanquest PDF Editor',
     resourceUri,
     {
       description: 'Interactive PDF viewer powered by @avanquest/pdf-web-viewer.',

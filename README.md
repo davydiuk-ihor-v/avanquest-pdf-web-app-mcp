@@ -1,4 +1,4 @@
-# Avanquest PDF Viewer — Claude Desktop Extension
+# Avanquest PDF Editor — Claude Desktop Extension
 
 View and edit PDF files directly inside Claude Desktop. The viewer renders inline in the chat window; Claude can read, annotate, reformat, and save the document through a rich set of tools — no separate application needed.
 
