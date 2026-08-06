@@ -1,4 +1,4 @@
-﻿import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { setupClientInfo } from './client-info.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import {
@@ -16,6 +16,11 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID, createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
+// Cowork mode runs separate server instances for the model's tool calls and the
+// widget iframe's callServerTool requests, so everything the two sides exchange
+// (viewer commands/results, doc-open marker, open target, file tokens) lives on
+// disk rather than in process memory. See shared-state.ts.
+import * as shared from './shared-state.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -159,10 +164,11 @@ function getWorkerManifest(): Promise<Record<string, string>> {
 const STUB_HTML_PATH = path.join(__dirname, 'mcp-app.html');
 const DIAG_HTML_PATH = path.join(__dirname, 'diag.html');
 
-type FileEntry = { fullPath: string; name: string; expiresAt: number; isTemp?: boolean };
-const fileTokens = new Map<string, FileEntry>();
+// File tokens live in shared-state.ts (disk-backed) so a token minted by the
+// MCP-side instance resolves in the widget-side instance in Cowork mode.
+// saveBuffers stays in memory: all chunks of one save_pdf upload arrive at the
+// same instance (the widget's), so they never cross a process boundary.
 const saveBuffers = new Map<string, Buffer[]>();
-const TOKEN_TTL_MS = 30 * 60 * 1000;
 
 // Appended to edit-tool descriptions so the model doesn't paraphrase away the
 // save-location note docNote() attaches to the response text — observed in
@@ -172,22 +178,87 @@ const TOKEN_TTL_MS = 30 * 60 * 1000;
 // than something to tell the user.
 const RELAY_SAVE_NOTE_INSTRUCTION = ' IMPORTANT: the response includes a bracketed note about where this change was saved (or that a working copy will be created) -- always relay that note to the user, even if it says a working copy is about to be created rather than a concrete path.';
 
-function pruneExpired(): void {
-  const now = Date.now();
-  for (const [token, entry] of fileTokens) {
-    if (entry.expiresAt <= now) {
-      if (entry.isTemp) fs.unlink(entry.fullPath).catch(() => {});
-      fileTokens.delete(token);
-    }
-  }
+// The viewer's WASM engine hard-rejects any color string that doesn't start
+// with '#' (the "Color string should start with '#'" toast) — and until
+// RDB-7878 the annotation tools forwarded whatever the model sent and even
+// reported success. Models do occasionally pass CSS color names ("green") or
+// bare hex ("00FF00") despite the hex examples in every description, so
+// normalize those into engine-accepted "#RRGGBB" instead of failing, and
+// reject anything else with a message the model can act on.
+// Same tolerance for booleans and numbers (see normalizeColor below): the
+// cowork agent (and other MCP clients we don't control) sends numbers and
+// booleans as JSON strings often enough that strict z.number()/z.boolean()
+// schemas rejected whole tool calls with -32602 before any handler ran. All
+// numeric params use z.coerce.number() (accepts "5"), and boolean params use
+// this union (accepts "true"/"false"). The SDK serializes the input side of
+// transforms to JSON Schema (io: 'input'), so the advertised schema stays a
+// clean boolean|enum hint.
+const zBool = z.union([
+  z.boolean(),
+  z.enum(['true', 'false', 'True', 'False']).transform((v) => v.toLowerCase() === 'true'),
+]);
+
+// Shape names get the same treatment: "нарисуй квадрат" makes a model send
+// shape: "square" even though the enum says "rectangle". Widen the schema to
+// union([enum, string]) (the enum hint survives in the advertised JSON Schema)
+// and map the common synonyms here; anything unknown gets an actionable error.
+const SHAPE_SYNONYMS: Record<string, string> = {
+  square: 'rectangle', box: 'rectangle', rect: 'rectangle',
+  circle: 'oval', ellipse: 'oval', round: 'oval',
+  diamond: 'rhombus',
+};
+
+function normalizeShape(value: string, allowed: readonly string[]): string | null {
+  const s = value.trim().toLowerCase();
+  const mapped = SHAPE_SYNONYMS[s] ?? s;
+  return allowed.includes(mapped) ? mapped : null;
 }
 
-function mintToken(fullPath: string, name: string, isTemp = false): string {
-  pruneExpired();
-  const token = randomUUID();
-  fileTokens.set(token, { fullPath, name, expiresAt: Date.now() + TOKEN_TTL_MS, isTemp });
-  return token;
+const CSS_COLOR_NAMES: Record<string, string> = {
+  black: '#000000', white: '#FFFFFF', red: '#FF0000', green: '#00AA00',
+  lime: '#00FF00', blue: '#0000FF', yellow: '#FFFF00', orange: '#FF6600',
+  purple: '#800080', violet: '#8A2BE2', pink: '#FFC0CB', brown: '#A52A2A',
+  gray: '#808080', grey: '#808080', cyan: '#00FFFF', magenta: '#FF00FF',
+  gold: '#FFD700', silver: '#C0C0C0', navy: '#000080', teal: '#008080',
+  maroon: '#800000', olive: '#808000',
+};
+
+function normalizeColor(value: string): string | null {
+  const s = value.trim();
+  const named = CSS_COLOR_NAMES[s.toLowerCase()];
+  if (named) return named;
+  const hex = (s.startsWith('#') ? s : '#' + s).toUpperCase();
+  if (/^#[0-9A-F]{3}$/.test(hex)) {
+    return '#' + [...hex.slice(1)].map((c) => c + c).join('');
+  }
+  // 8 hex digits = #AARRGGBB, used by the format tools ("#00000000" removes
+  // a highlight/underline/strikeout) — pass through untouched.
+  if (/^#([0-9A-F]{6}|[0-9A-F]{8})$/.test(hex)) return hex;
+  return null;
 }
+
+/**
+ * Normalize every color-valued argument of a tool call at once. Returns the
+ * normalized map, or an error string naming the offending parameter for the
+ * tool to hand back to the model.
+ */
+function normalizeColors<T extends Record<string, string | undefined>>(
+  inputs: T,
+): { ok: true; colors: T } | { ok: false; error: string } {
+  const out: Record<string, string | undefined> = {};
+  for (const [key, raw] of Object.entries(inputs)) {
+    if (raw === undefined) continue;
+    const normalized = normalizeColor(raw);
+    if (!normalized) {
+      return { ok: false, error: `Invalid ${key} "${raw}" -- use a hex color like "#00AA00" ("#RRGGBB", or "#AARRGGBB" with alpha).` };
+    }
+    out[key] = normalized;
+  }
+  return { ok: true, colors: out as T };
+}
+
+const pruneExpired = shared.pruneExpiredTokens;
+const mintToken = shared.mintToken;
 
 // Persisted across Claude Desktop restarts (see fullscreenGrantedTokens above).
 // Capped so the file can't grow unbounded over months of use — oldest entries
@@ -373,7 +444,7 @@ async function startAssetServer(): Promise<{ port: number; baseUrl: string }> {
       if (rel.startsWith('file/')) {
         pruneExpired();
         const token = rel.slice('file/'.length);
-        const entry = fileTokens.get(token);
+        const entry = shared.getFileToken(token);
         if (!entry) {
           // Cowork mode runs separate server instances: the iframe's instance may not
           // have the token minted by the MCP-side instance. Fall back to the filePath
@@ -426,7 +497,7 @@ async function startAssetServer(): Promise<{ port: number; baseUrl: string }> {
 
   app.get('/file/:token', (req, res) => {
     pruneExpired();
-    const entry = fileTokens.get(req.params.token);
+    const entry = shared.getFileToken(req.params.token);
     if (!entry) {
       res.status(404).send('not found or expired');
       return;
@@ -568,13 +639,12 @@ async function main(): Promise<void> {
 
       const token = mintToken(absolutePath, name, isTemp);
       const fileUrl = `${baseUrl}/file/${token}`;
-      _lastDocState = '';
-      _lastWorkingFile = '';
-      _pendingDocOpen = true;
-      pendingViewerCommand = null;
+      shared.resetDocState();
+      shared.setDocOpenPending(true);
+      shared.setViewerCommand(null);
 
       const structured = { url: fileUrl, name, token, filePath: pdfUrl ?? absolutePath };
-      pendingOpenTarget = structured;
+      shared.setOpenTarget(structured);
       return {
         content: [
           { type: 'text', text: `Opened ${name} in the viewer.` },
@@ -595,15 +665,15 @@ async function main(): Promise<void> {
       inputSchema: {
         token: z.string(),
         chunk: z.string().describe('base64-encoded bytes'),
-        offset: z.number().int().min(0),
-        totalSize: z.number().int().min(1),
+        offset: z.coerce.number().int().min(0),
+        totalSize: z.coerce.number().int().min(1),
         savePath: z.string().optional().describe('Override save path; defaults to original file path'),
       },
       _meta: { ui: { resourceUri, visibility: ['app'] as const } },
     },
     async ({ token, chunk, offset, totalSize, savePath }) => {
       pruneExpired();
-      const entry = fileTokens.get(token);
+      const entry = shared.getFileToken(token);
       if (!entry) {
         return {
           content: [{ type: 'text', text: JSON.stringify({ error: 'PDF not found or token expired' }) }],
@@ -647,7 +717,7 @@ async function main(): Promise<void> {
     },
     async ({ token, filePath }) => {
       pruneExpired();
-      const entry = fileTokens.get(token);
+      const entry = shared.getFileToken(token);
       let readPath: string | null = entry?.fullPath ?? null;
       if (!readPath && filePath) {
         const tmpDir = os.tmpdir();
@@ -707,7 +777,7 @@ async function main(): Promise<void> {
         filePath,
         command: { type: 'compress_pdf', compression: compression ?? 'medium', outputPath: savePath },
       };
-      pendingOpenTarget = structured;
+      shared.setOpenTarget(structured);
       return {
         content: [
           { type: 'text', text: `Opening ${name} for compression (compression: ${compression ?? 'medium'})...` },
@@ -760,7 +830,7 @@ async function main(): Promise<void> {
         filePath: firstPath,
         command: { type: 'merge_pdf', files, outputPath: savePath },
       };
-      pendingOpenTarget = structured;
+      shared.setOpenTarget(structured);
       return {
         content: [
           { type: 'text', text: `Opening ${files[0].name} for merge (${paths.length} files)...` },
@@ -781,7 +851,7 @@ async function main(): Promise<void> {
       inputSchema: {
         path: z.string().describe("Absolute path to the PDF file to split"),
         ranges: z.array(z.string()).optional().describe('Page ranges for each output file, e.g. ["1-3","4-6","7"]. Supports ranges (1-3), comma lists (1,3,5), or single pages (2).'),
-        pagesPerFile: z.number().int().min(1).optional().describe('Split into equal chunks of N pages each. Alternative to ranges.'),
+        pagesPerFile: z.coerce.number().int().min(1).optional().describe('Split into equal chunks of N pages each. Alternative to ranges.'),
         outputDir: z.string().optional().describe('Directory for output files. Defaults to same directory as the input file.'),
       },
       outputSchema: {
@@ -812,7 +882,7 @@ async function main(): Promise<void> {
         filePath,
         command: { type: 'split_pdf', ranges, pagesPerFile, outputDir: outDir, baseName },
       };
-      pendingOpenTarget = structured;
+      shared.setOpenTarget(structured);
       return {
         content: [
           { type: 'text', text: `Opening ${name} for split...` },
@@ -823,28 +893,13 @@ async function main(): Promise<void> {
     },
   );
 
-  let pendingViewerCommand: Record<string, unknown> | null = null;
-  let pendingSearchResult: { count: number; pages: number[] } | null = null;
-  let pendingViewerResult: { type: string; data: unknown } | null = null;
-  let _pendingDocOpen = false;
-
-  // Last PDF open target (url/token/name/command) set by display_pdf/compress/merge/
-  // split. The app fetches this via the get_pending_open tool because some hosts
-  // (Claude Desktop <=1.20186) declare no structuredContent capability and strip
-  // structuredContent from the tool-result notification, so the app never receives
-  // the token/url that way. The app->server callServerTool channel is NOT stripped.
-  let pendingOpenTarget:
-    | { url: string; name: string; token: string; filePath: string; command?: Record<string, unknown> }
-    | null = null;
-
-  // Tracks last-known document state injected by mcp-app.ts via report_viewer_result.
-  // Appended to every viewer tool response so Claude always knows pageCount after each op.
-  let _lastDocState = '';
-  // RDB-7843: path of the single persistent working copy (<name>_updated.pdf)
-  // mcp-app.ts auto-saves edits into, injected the same way as _lastDocState.
-  // Surfacing it on every edit response (not just save_pdf's own) means Claude
-  // never needs a separate "where did this get saved" round trip.
-  let _lastWorkingFile = '';
+  // The viewer command/result channel, the doc-open marker, the last open
+  // target (get_pending_open fallback for hosts that strip structuredContent —
+  // Claude Desktop <=1.20186), and the docNote inputs (_lastDocState /
+  // _lastWorkingFile, RDB-7843) all live in shared-state.ts now: in Cowork mode
+  // the model's tool calls and the widget's callServerTool requests are served
+  // by SEPARATE server processes, so in-memory variables never crossed over and
+  // every viewer-bound tool timed out (RDB-7878).
   // Mirrors mcp-app.ts's MUTATING_COMMAND_TYPES — the report_viewer_result
   // `type` values that represent an actual document edit (as opposed to a
   // read, like get_view_state or read_annotations, which also round-trip
@@ -865,10 +920,11 @@ async function main(): Promise<void> {
     // no working-copy path to report yet — say so anyway instead of silently
     // omitting any save-related note, so Claude/the user aren't left
     // wondering whether the change was persisted at all.
-    const savedNote = _lastWorkingFile
-      ? `saved to ${_lastWorkingFile}`
+    const { lastDocState, lastWorkingFile } = shared.getDocState();
+    const savedNote = lastWorkingFile
+      ? `saved to ${lastWorkingFile}`
       : (isEdit ? 'a working copy of this file will be created and used for all further edits' : '');
-    const parts = [_lastDocState, savedNote].filter(Boolean);
+    const parts = [lastDocState, savedNote].filter(Boolean);
     return parts.length ? ` [${parts.join(' — ')}]` : '';
   }
 
@@ -888,11 +944,23 @@ async function main(): Promise<void> {
   // server process's lifetime — otherwise every restart forgets which tokens
   // were already granted, and every widget still open in chat history goes
   // fullscreen again on the next remount. Persisted to a small JSON file.
-  const fullscreenGrantedTokens = loadFullscreenGrantedTokens();
+  // (The granted-token set is re-read from disk inside claim_fullscreen on
+  // every call — a startup-time cache would go stale across the sibling
+  // server instances Cowork mode runs.)
 
   type TR = { content: [{ type: 'text'; text: string }]; isError?: true };
   const ok  = (text: string): TR => ({ content: [{ type: 'text' as const, text }] });
   const nok = (text: string): TR => ({ content: [{ type: 'text' as const, text }], isError: true });
+
+  // Hard ceiling on how long pollViewerResult will wait out an in-progress
+  // document open (see below) before giving up on it entirely and letting
+  // the normal per-call timeout run its course anyway. Kept modest (not,
+  // say, 30s+) on purpose: if the widget never connects at all (e.g. a host
+  // that doesn't render ui:// resources, or a genuinely stuck/failed editor
+  // init that somehow still didn't clear _pendingDocOpen), every affected
+  // tool call pays this in full before even starting its own timeout —
+  // better to fail in ~15s than ~40s when nothing is ever going to arrive.
+  const DOC_OPEN_GRACE_CAP_MS = 15_000;
 
   async function pollViewerResult<T>(
     command: Record<string, unknown>,
@@ -900,15 +968,32 @@ async function main(): Promise<void> {
     timeoutMs: number,
     handler: (data: T) => TR,
   ): Promise<TR> {
-    pendingViewerResult = null;
-    pendingViewerCommand = command;
+    shared.setViewerResult(null);
+    shared.setViewerCommand(command);
+    // display_pdf returns as soon as a token is minted, well before the
+    // widget has even fetched file bytes, let alone finished PdfEditor()
+    // bootstrap (dynamic import, license check, WASM, doc load) — which can
+    // itself take a while on a cold start. Without this, a fast follow-up
+    // tool call's own timeoutMs clock ran concurrently with that bootstrap
+    // and could expire before the document ever finished opening, even
+    // though nothing was actually wrong — reported as a false "Timed out"
+    // for a document that genuinely was mid-open. Wait the open out first
+    // (capped, so a truly stuck open doesn't hang forever) so this call's
+    // own timeout budget only starts counting once there's an actual
+    // document to poll against.
+    if (shared.isDocOpenPending()) {
+      const openDeadline = Date.now() + DOC_OPEN_GRACE_CAP_MS;
+      while (shared.isDocOpenPending() && Date.now() < openDeadline) {
+        await new Promise<void>((r) => setTimeout(r, 300));
+      }
+    }
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       await new Promise<void>((r) => setTimeout(r, 300));
-      if (pendingViewerResult !== null) {
-        const pr = pendingViewerResult as { type: string; data: unknown };
+      const pr = shared.peekViewerResult();
+      if (pr !== null) {
         if (pr.type !== resultType) continue;
-        pendingViewerResult = null;
+        shared.clearViewerResult();
         const result = handler(pr.data as T);
         if (!result.isError && result.content[0]) {
           result.content[0] = { type: 'text' as const, text: result.content[0].text + docNote(MUTATING_RESULT_TYPES.has(resultType)) };
@@ -916,7 +1001,7 @@ async function main(): Promise<void> {
         return result;
       }
     }
-    pendingViewerCommand = null;
+    shared.setViewerCommand(null);
     return nok('Timed out -- make sure a PDF is open in the viewer.');
   }
 
@@ -928,27 +1013,26 @@ async function main(): Promise<void> {
       description: 'Search for text in the currently open PDF. Highlights all matches in the viewer and returns the total match count and 1-based page numbers where matches were found. The returned page numbers can be used directly in tools that accept a "page" parameter.',
       inputSchema: {
         query: z.string().describe('Text to search for'),
-        caseSensitive: z.boolean().optional().describe('Case-sensitive search (default: false)'),
-        wholeWord: z.boolean().optional().describe('Match whole words only (default: false)'),
+        caseSensitive: zBool.optional().describe('Case-sensitive search (default: false)'),
+        wholeWord: zBool.optional().describe('Match whole words only (default: false)'),
       },
     },
     async ({ query, caseSensitive, wholeWord }) => {
       if (!query.trim()) {
         return { content: [{ type: 'text' as const, text: 'Search query must not be empty.' }], isError: true };
       }
-      pendingSearchResult = null;
-      pendingViewerCommand = {
+      shared.setSearchResult(null);
+      shared.setViewerCommand({
         type: 'search_text',
         query,
         caseSensitive: caseSensitive ?? false,
         wholeWord: wholeWord ?? false,
-      };
+      });
       const deadline = Date.now() + 15000;
       while (Date.now() < deadline) {
         await new Promise<void>((r) => setTimeout(r, 500));
-        if (pendingSearchResult !== null) {
-          const sr = pendingSearchResult as { count: number; pages: number[] };
-          pendingSearchResult = null;
+        const sr = shared.takeSearchResult();
+        if (sr !== null) {
           if (sr.count === 0) {
             return { content: [{ type: 'text' as const, text: `No matches found for "${query}".` + docNote() }] };
           }
@@ -963,7 +1047,7 @@ async function main(): Promise<void> {
           };
         }
       }
-      pendingViewerCommand = null;
+      shared.setViewerCommand(null);
       return {
         content: [{ type: 'text' as const, text: 'Search timed out -- make sure a PDF is open in the viewer.' }],
         isError: true,
@@ -982,7 +1066,7 @@ async function main(): Promise<void> {
       },
     },
     async ({ direction }) => {
-      pendingViewerCommand = { type: 'navigate_search', direction };
+      shared.setViewerCommand({ type: 'navigate_search', direction });
       return {
         content: [{ type: 'text' as const, text: `Navigating to ${direction} search result.` }],
       };
@@ -994,17 +1078,33 @@ async function main(): Promise<void> {
     {
       title: 'Rotate Pages',
       annotations: { readOnlyHint: false, destructiveHint: false },
-      description: 'Rotate pages in the currently open PDF viewer. Use pages for specific 1-based page numbers (e.g. [1,3]), or omit to rotate all pages. Angle: 90, 180, or 270.' + RELAY_SAVE_NOTE_INSTRUCTION,
+      description: 'Rotate pages in the currently open PDF viewer. Use pages for specific 1-based page numbers (e.g. [1,3]), or omit to rotate all pages. Angle: 90, 180, or 270 degrees clockwise (negative values rotate counter-clockwise).' + RELAY_SAVE_NOTE_INSTRUCTION,
       inputSchema: {
-        angle: z.union([z.literal(90), z.literal(180), z.literal(270)]).describe('Rotation angle in degrees (90, 180, or 270)'),
-        pages: z.array(z.number().int().min(1)).optional().describe('1-based page numbers to rotate. Omit to rotate all pages.'),
+        // Was z.union([z.literal(90), ...]) — models routinely send "90" as a
+        // string or -90 for counter-clockwise, and strict literal validation
+        // rejected the whole call at the SDK layer ("Invalid input at angle")
+        // before the handler could help. Accept anything number-ish and
+        // normalize below, answering with an actionable error when it really
+        // isn't a right-angle rotation.
+        angle: z.union([z.coerce.number(), z.string()]).describe('Rotation angle in degrees: 90, 180, or 270 (clockwise). Negative rotates counter-clockwise (-90 == 270).'),
+        pages: z.array(z.coerce.number().int().min(1)).optional().describe('1-based page numbers to rotate. Omit to rotate all pages.'),
       },
     },
     async ({ angle, pages }) => {
-      pendingViewerCommand = { type: 'rotate_pages', angle, pages: pages ?? null };
-      return {
-        content: [{ type: 'text' as const, text: `Rotating ${pages ? `pages ${pages.join(',')}` : 'all pages'} by ${angle}°${docNote(true)}` }],
-      };
+      const parsed = typeof angle === 'string' ? Number(angle.trim()) : angle;
+      const normalized = Number.isFinite(parsed) ? ((parsed % 360) + 360) % 360 : NaN;
+      if (normalized !== 90 && normalized !== 180 && normalized !== 270) {
+        return nok(`Invalid angle ${JSON.stringify(angle)} -- use 90, 180, or 270 (or a negative multiple of 90 for counter-clockwise).`);
+      }
+      return pollViewerResult<{ success: boolean; error?: string }>(
+        { type: 'rotate_pages', angle: normalized, pages: pages ?? null },
+        'rotate_pages',
+        15_000,
+        (d) => {
+          if (!d.success) return nok(`Error: ${d.error ?? 'failed to rotate pages'}`);
+          return ok(`Rotated ${pages ? `pages ${pages.join(',')}` : 'all pages'} by ${normalized}°`);
+        },
+      );
     },
   );
 
@@ -1015,25 +1115,34 @@ async function main(): Promise<void> {
       annotations: { readOnlyHint: false, destructiveHint: false },
       description: 'Add a NEW shape annotation to the PDF. Use only for creating new annotations. To change color/opacity of an existing annotation, use update_annotation instead -- never delete and re-add just to change a property. Supported shapes: oval, rectangle, rhombus, line, arrow. Position and size are percentages of page dimensions (0--100).' + RELAY_SAVE_NOTE_INSTRUCTION,
       inputSchema: {
-        shape: z.enum(['oval', 'rectangle', 'rhombus', 'line', 'arrow']).describe('Shape type to draw'),
-        page: z.number().int().min(1).describe('1-based page number to draw on'),
-        x: z.number().min(0).max(99).describe('Left edge as % of page width (0=left, 100=right)'),
-        y: z.number().min(0).max(99).describe('Top edge as % of page height (0=top, 100=bottom)'),
-        width: z.number().min(1).max(100).describe('Width as % of page width'),
-        height: z.number().min(1).max(100).describe('Height as % of page height'),
+        shape: z.union([z.enum(['oval', 'rectangle', 'rhombus', 'line', 'arrow']), z.string()]).describe('Shape type to draw: oval, rectangle, rhombus, line, or arrow'),
+        page: z.coerce.number().int().min(1).describe('1-based page number to draw on'),
+        x: z.coerce.number().min(0).max(99).describe('Left edge as % of page width (0=left, 100=right)'),
+        y: z.coerce.number().min(0).max(99).describe('Top edge as % of page height (0=top, 100=bottom)'),
+        width: z.coerce.number().min(1).max(100).describe('Width as % of page width'),
+        height: z.coerce.number().min(1).max(100).describe('Height as % of page height'),
         color: z.string().optional().describe('Stroke color in hex, e.g. "#FF0000". Default: red'),
         fillColor: z.string().optional().describe('Fill color in hex, e.g. "#FFFF00". Optional.'),
-        borderWidth: z.number().int().min(1).max(20).optional().describe('Stroke width in points. Default: 2'),
+        borderWidth: z.coerce.number().int().min(1).max(20).optional().describe('Stroke width in points. Default: 2'),
       },
     },
     async ({ shape, page, x, y, width, height, color, fillColor, borderWidth }) => {
-      pendingViewerCommand = {
-        type: 'add_annotation', shape, page, x, y, width, height,
-        color: color ?? null, fillColor: fillColor ?? null, borderWidth: borderWidth ?? null,
-      };
-      return {
-        content: [{ type: 'text' as const, text: `Adding ${shape} on page ${page} at (${x}%, ${y}%) size ${width}%×${height}%${docNote(true)}` }],
-      };
+      const normalizedShape = normalizeShape(shape, ['oval', 'rectangle', 'rhombus', 'line', 'arrow']);
+      if (!normalizedShape) return nok(`Unknown shape "${shape}" -- use oval, rectangle, rhombus, line, or arrow.`);
+      const nc = normalizeColors({ color, fillColor });
+      if (!nc.ok) return nok(nc.error);
+      return pollViewerResult<{ success: boolean; error?: string }>(
+        {
+          type: 'add_annotation', shape: normalizedShape, page, x, y, width, height,
+          color: nc.colors.color ?? null, fillColor: nc.colors.fillColor ?? null, borderWidth: borderWidth ?? null,
+        },
+        'add_annotation',
+        15_000,
+        (d) => {
+          if (!d.success) return nok(`Error: ${d.error ?? 'failed to add annotation'}`);
+          return ok(`Added ${normalizedShape} on page ${page} at (${x}%, ${y}%) size ${width}%×${height}%`);
+        },
+      );
     },
   );
 
@@ -1045,16 +1154,20 @@ async function main(): Promise<void> {
       description: 'Find all occurrences of a word or phrase in the currently open PDF and draw a shape around each one. If the user has not specified shape or color -- ask them before calling: "Ð§ÐµÐ¼ Ð¾Ð±Ð²Ð¾Ð´Ð¸Ð¼ -- Ð¿Ñ€ÑÐ¼Ð¾ÑƒÐ³Ð¾Ð»ÑŒÐ½Ð¸ÐºÐ¾Ð¼ Ð¸Ð»Ð¸ Ð¾Ð²Ð°Ð»Ð¾Ð¼? ÐšÐ°ÐºÐ¾Ð¹ Ñ†Ð²ÐµÑ‚? ÐÐ° Ð²ÑÐµÑ... ÑÑ‚Ñ€Ð°Ð½Ð¸Ñ†Ð°Ñ... Ð¸Ð»Ð¸ Ñ‚Ð¾Ð»ÑŒÐºÐ¾ Ð½Ð° Ð¾Ð´Ð½Ð¾Ð¹?" Available shapes: rectangle (default) or oval. Colors: any hex value, e.g. red=#FF0000, blue=#0000FF, green=#00AA00.',
       inputSchema: {
         text: z.string().min(1).describe('Text to search for and circle (case-insensitive)'),
-        page: z.number().int().min(1).optional().describe('Limit to a specific 1-based page number. Omit to circle on all pages.'),
-        shape: z.enum(['rectangle', 'oval']).optional().describe('Shape to draw: rectangle (default) or oval'),
+        page: z.coerce.number().int().min(1).optional().describe('Limit to a specific 1-based page number. Omit to circle on all pages.'),
+        shape: z.union([z.enum(['rectangle', 'oval']), z.string()]).optional().describe('Shape to draw: rectangle (default) or oval'),
         color: z.string().optional().describe('Stroke color in hex: "#FF0000"=red (default), "#0000FF"=blue, "#00AA00"=green, "#FF6600"=orange'),
-        border_width: z.number().int().min(1).max(20).optional().describe('Border thickness in points: 1=thin, 2=normal (default), 3-5=thick'),
-        padding: z.number().min(0).max(20).optional().describe('Extra space around the text in points. Default: 2'),
+        border_width: z.coerce.number().int().min(1).max(20).optional().describe('Border thickness in points: 1=thin, 2=normal (default), 3-5=thick'),
+        padding: z.coerce.number().min(0).max(20).optional().describe('Extra space around the text in points. Default: 2'),
       },
     },
-    async ({ text, page, shape, color, border_width, padding }) =>
-      pollViewerResult<{ count: number; error?: string }>(
-        { type: 'circle_text', text, page: page ?? null, shape: shape ?? 'rectangle', color: color ?? null, border_width: border_width ?? null, padding: padding ?? null },
+    async ({ text, page, shape, color, border_width, padding }) => {
+      const normalizedShape = shape === undefined ? 'rectangle' : normalizeShape(shape, ['rectangle', 'oval']);
+      if (!normalizedShape) return nok(`Unknown shape "${shape}" -- use rectangle or oval.`);
+      const nc = normalizeColors({ color });
+      if (!nc.ok) return nok(nc.error);
+      return pollViewerResult<{ count: number; error?: string }>(
+        { type: 'circle_text', text, page: page ?? null, shape: normalizedShape, color: nc.colors.color ?? null, border_width: border_width ?? null, padding: padding ?? null },
         'circle_text',
         15_000,
         (d) => {
@@ -1063,7 +1176,8 @@ async function main(): Promise<void> {
           const where = page ? ` on page ${page}` : '';
           return ok(`Circled ${d.count} occurrence(s) of "${text}"${where}.`);
         },
-      ),
+      );
+    },
   );
 
   server.registerTool(
@@ -1108,7 +1222,7 @@ async function main(): Promise<void> {
       description: 'Apply font formatting to the currently selected text in the PDF viewer. The user must first select text manually in the viewer (by dragging the mouse over text while search is active). Call get_selection_info first to confirm what is selected.',
       inputSchema: {
         font_family: z.string().optional().describe('Font family name, e.g. "Helvetica", "Arial", "Times New Roman"'),
-        font_size: z.number().min(1).max(500).optional().describe('Font size in points, e.g. 12'),
+        font_size: z.coerce.number().min(1).max(500).optional().describe('Font size in points, e.g. 12'),
         font_style: z.enum(['regular', 'italic', 'bold', 'bold_italic']).optional().describe('Font style'),
         text_color: z.string().optional().describe('Text color in hex: "#FF0000"=red, "#000000"=black. Prefix #FF for full opacity.'),
         highlight_color: z.string().optional().describe('Highlight/background color in hex. Use "#00000000" to remove.'),
@@ -1116,16 +1230,19 @@ async function main(): Promise<void> {
         strikeout_color: z.string().optional().describe('Strikeout color in hex. Use "#00000000" to remove.'),
       },
     },
-    async ({ font_family, font_size, font_style, text_color, highlight_color, underline_color, strikeout_color }) =>
-      pollViewerResult<{ success: boolean; error?: string }>(
-        { type: 'format_selected_text', font_family, font_size, font_style, text_color, highlight_color, underline_color, strikeout_color },
+    async ({ font_family, font_size, font_style, text_color, highlight_color, underline_color, strikeout_color }) => {
+      const nc = normalizeColors({ text_color, highlight_color, underline_color, strikeout_color });
+      if (!nc.ok) return nok(nc.error);
+      return pollViewerResult<{ success: boolean; error?: string }>(
+        { type: 'format_selected_text', font_family, font_size, font_style, ...nc.colors },
         'format_selected_text',
         8_000,
         (d) => {
           if (!d.success) return nok(d.error ?? 'Failed to format selection');
           return ok('Selected text formatted successfully.');
         },
-      ),
+      );
+    },
   );
 
   server.registerTool(
@@ -1152,18 +1269,23 @@ async function main(): Promise<void> {
       annotations: { readOnlyHint: false, destructiveHint: false },
       description: 'Insert a blank page into the currently open PDF. Use after_page: 0 to insert before the first page (new page 1), after_page: N to insert after page N, or omit after_page to append at the end.' + RELAY_SAVE_NOTE_INSTRUCTION,
       inputSchema: {
-        after_page: z.number().int().min(0).optional()
+        after_page: z.coerce.number().int().min(0).optional()
           .describe('1-based page number to insert after. Use 0 to insert as the first page. Omit to append at the end.'),
       },
     },
     async ({ after_page }) => {
-      pendingViewerCommand = { type: 'insert_blank_page', after_page: after_page ?? null };
       const where = after_page === 0 ? 'as first page'
         : after_page == null ? 'at the end'
         : `after page ${after_page}`;
-      return {
-        content: [{ type: 'text' as const, text: `Inserting blank page ${where}...${docNote(true)}` }],
-      };
+      return pollViewerResult<{ success: boolean; error?: string }>(
+        { type: 'insert_blank_page', after_page: after_page ?? null },
+        'insert_blank_page',
+        15_000,
+        (d) => {
+          if (!d.success) return nok(`Error: ${d.error ?? 'failed to insert page'}`);
+          return ok(`Inserted blank page ${where}.`);
+        },
+      );
     },
   );
 
@@ -1174,13 +1296,13 @@ async function main(): Promise<void> {
       annotations: { readOnlyHint: false, destructiveHint: false },
       description: 'Insert an image onto a specific page of the currently open PDF. Use image_svg for any generated/drawn image (SVG XML string -- preferred for Claude-generated graphics, no file needed). Use image_url to download from the internet, or image_path for a local file. Position (x, y) is the bottom-left corner as % of page dimensions (0--100); width is % of page width. Omit position/size to center at 50% page width.' + RELAY_SAVE_NOTE_INSTRUCTION,
       inputSchema: {
-        page: z.number().int().min(1).describe('1-based page number to add the image to'),
+        page: z.coerce.number().int().min(1).describe('1-based page number to add the image to'),
         image_svg: z.string().optional().describe('SVG XML string to render as an image. Preferred for Claude-generated graphics -- pass the full SVG markup directly, no file or base64 needed.'),
         image_url: z.string().optional().describe('URL of a remote image to download (PNG or JPEG)'),
         image_path: z.string().optional().describe('Absolute path to a local image file (PNG or JPEG)'),
-        x: z.number().min(0).max(100).optional().describe('Left edge of image as % of page width (0=left edge). Omit to center horizontally.'),
-        y: z.number().min(0).max(100).optional().describe('Bottom edge of image as % of page height (0=bottom). Omit to center vertically.'),
-        width: z.number().min(1).max(100).optional().describe('Image width as % of page width. Omit to use 50% of page width maintaining aspect ratio.'),
+        x: z.coerce.number().min(0).max(100).optional().describe('Left edge of image as % of page width (0=left edge). Omit to center horizontally.'),
+        y: z.coerce.number().min(0).max(100).optional().describe('Bottom edge of image as % of page height (0=bottom). Omit to center vertically.'),
+        width: z.coerce.number().min(1).max(100).optional().describe('Image width as % of page width. Omit to use 50% of page width maintaining aspect ratio.'),
       },
     },
     async ({ page, image_svg, image_path, image_url, x, y, width }) => {
@@ -1212,10 +1334,17 @@ async function main(): Promise<void> {
       const tmpPath = path.join(os.tmpdir(), `pwv-img-${randomUUID()}${ext}`);
       await fs.writeFile(tmpPath, bytes);
       const token = mintToken(tmpPath, `image${ext}`, true);
-      pendingViewerCommand = { type: 'add_image_to_page', page, token, x: x ?? null, y: y ?? null, width: width ?? null };
-      return {
-        content: [{ type: 'text' as const, text: `Adding image to page ${page}...${docNote(true)}` }],
-      };
+      return pollViewerResult<{ success: boolean; error?: string }>(
+        { type: 'add_image_to_page', page, token, x: x ?? null, y: y ?? null, width: width ?? null },
+        'add_image_to_page',
+        // Image decode + engine insert can be slow for big images — give it
+        // more headroom than the simpler edits.
+        30_000,
+        (d) => {
+          if (!d.success) return nok(`Error: ${d.error ?? 'failed to add image'}`);
+          return ok(`Image added to page ${page}.`);
+        },
+      );
     },
   );
 
@@ -1227,7 +1356,7 @@ async function main(): Promise<void> {
       description: 'Close the currently open document in the PDF viewer.',
     },
     async () => {
-      pendingViewerCommand = { type: 'close_document' };
+      shared.setViewerCommand({ type: 'close_document' });
       return { content: [{ type: 'text' as const, text: 'Closing document.' }] };
     },
   );
@@ -1240,11 +1369,14 @@ async function main(): Promise<void> {
       description: 'Return current viewing state. Returns: page (1-based current page number), pageCount (total pages), document title, and file path. IMPORTANT: the returned "page" is a 1-based page number -- use it directly in other tools that accept a "page" parameter.',
     },
     async () =>
-      pollViewerResult<{ page: number; pageCount: number; title: string; filePath: string }>(
+      pollViewerResult<{ page: number; pageCount: number; title: string; filePath: string; error?: string }>(
         { type: 'get_view_state' },
         'view_state',
         10_000,
-        (d) => ok(`Page ${d.page} of ${d.pageCount}. Title: "${d.title}". File: ${d.filePath || '(unknown)'}`),
+        (d) => {
+          if (d.error) return nok(`Error: ${d.error}`);
+          return ok(`Page ${d.page} of ${d.pageCount}. Title: "${d.title}". File: ${d.filePath || '(unknown)'}`);
+        },
       ),
   );
 
@@ -1255,11 +1387,11 @@ async function main(): Promise<void> {
       annotations: { readOnlyHint: false, destructiveHint: false },
       description: 'Navigate to a specific page in the currently open PDF document.',
       inputSchema: {
-        page: z.number().int().min(1).describe('1-based page number to navigate to'),
+        page: z.coerce.number().int().min(1).describe('1-based page number to navigate to'),
       },
     },
     async ({ page }) => {
-      pendingViewerCommand = { type: 'set_view_state', page };
+      shared.setViewerCommand({ type: 'set_view_state', page });
       return { content: [{ type: 'text' as const, text: `Navigating to page ${page}.` + docNote() }] };
     },
   );
@@ -1293,7 +1425,7 @@ async function main(): Promise<void> {
       annotations: { readOnlyHint: true },
       description: 'Read width, height (in PDF points), and rotation for a specific page in the currently open document.',
       inputSchema: {
-        page: z.number().int().min(1).describe('1-based page number'),
+        page: z.coerce.number().int().min(1).describe('1-based page number'),
       },
     },
     async ({ page }) =>
@@ -1315,8 +1447,8 @@ async function main(): Promise<void> {
       annotations: { readOnlyHint: false, destructiveHint: false },
       description: 'Delete an annotation from the currently open PDF by page and annotation index. Use read_annotations to list annotations and their indices first.',
       inputSchema: {
-        page: z.number().int().min(1).describe('1-based page number containing the annotation'),
-        annotIndex: z.number().int().min(0).describe('0-based annotation index on that page'),
+        page: z.coerce.number().int().min(1).describe('1-based page number containing the annotation'),
+        annotIndex: z.coerce.number().int().min(0).describe('0-based annotation index on that page'),
       },
     },
     async ({ page, annotIndex }) =>
@@ -1338,11 +1470,11 @@ async function main(): Promise<void> {
       annotations: { readOnlyHint: false, destructiveHint: false },
       description: 'Modify properties of an existing annotation IN PLACE (stroke color, fill color, opacity, or text content for FreeText annotations). This changes the annotation directly -- do NOT delete and re-add. Use read_annotations first to get the annotIndex.',
       inputSchema: {
-        page: z.number().int().min(1).describe('1-based page number containing the annotation'),
-        annotIndex: z.number().int().min(0).describe('0-based annotation index from read_annotations'),
+        page: z.coerce.number().int().min(1).describe('1-based page number containing the annotation'),
+        annotIndex: z.coerce.number().int().min(0).describe('0-based annotation index from read_annotations'),
         color: z.string().optional().describe('Stroke color in hex, e.g. "#FF0000"'),
         fillColor: z.string().optional().describe('Fill/interior color in hex, e.g. "#FFFF00"'),
-        opacity: z.number().min(0).max(1).optional().describe('Opacity from 0 (transparent) to 1 (opaque)'),
+        opacity: z.coerce.number().min(0).max(1).optional().describe('Opacity from 0 (transparent) to 1 (opaque)'),
         text: z.string().optional().describe('Text content (only for FreeText annotations)'),
       },
     },
@@ -1350,8 +1482,10 @@ async function main(): Promise<void> {
       if (!color && !fillColor && opacity === undefined && text === undefined) {
         return nok('Provide at least one property to change: color, fillColor, opacity, or text.');
       }
+      const nc = normalizeColors({ color, fillColor });
+      if (!nc.ok) return nok(nc.error);
       return pollViewerResult<{ success: boolean; error?: string }>(
-        { type: 'update_annotation', page, annotIndex, color: color ?? null, fillColor: fillColor ?? null, opacity: opacity ?? null, text: text ?? null },
+        { type: 'update_annotation', page, annotIndex, color: nc.colors.color ?? null, fillColor: nc.colors.fillColor ?? null, opacity: opacity ?? null, text: text ?? null },
         'update_annotation',
         10_000,
         (d) => {
@@ -1369,7 +1503,7 @@ async function main(): Promise<void> {
       annotations: { readOnlyHint: true },
       description: 'List all annotations on a page (or the whole document). Returns index, type, position, color and comment for each annotation. Use the returned index with delete_annotation.',
       inputSchema: {
-        page: z.number().int().min(1).optional().describe('1-based page number. Omit to read all pages.'),
+        page: z.coerce.number().int().min(1).optional().describe('1-based page number. Omit to read all pages.'),
       },
     },
     async ({ page }) =>
@@ -1399,21 +1533,21 @@ async function main(): Promise<void> {
       annotations: { readOnlyHint: true },
       description: 'Render a page of the currently open PDF as a PNG image. Returns the image so it can be visually inspected.',
       inputSchema: {
-        page: z.number().int().min(1).describe('1-based page number to render'),
-        zoom: z.number().min(0.1).max(2).optional().describe('Zoom factor (default: 0.5). Use 1.0 for higher resolution.'),
+        page: z.coerce.number().int().min(1).describe('1-based page number to render'),
+        zoom: z.coerce.number().min(0.1).max(2).optional().describe('Zoom factor (default: 0.5). Use 1.0 for higher resolution.'),
       },
     },
     async ({ page, zoom }) => {
-      pendingViewerResult = null;
-      pendingViewerCommand = { type: 'get_page_image', page, zoom: zoom ?? 0.5 };
+      shared.setViewerResult(null);
+      shared.setViewerCommand({ type: 'get_page_image', page, zoom: zoom ?? 0.5 });
       const deadline = Date.now() + 30000;
       while (Date.now() < deadline) {
         await new Promise<void>((r) => setTimeout(r, 300));
-        if (pendingViewerResult !== null) {
-          const pr = pendingViewerResult as { type: string; data: unknown };
+        const pr = shared.peekViewerResult();
+        if (pr !== null) {
           if (pr.type !== 'get_page_image') continue;
           const d = pr.data as { base64?: string; error?: string };
-          pendingViewerResult = null;
+          shared.clearViewerResult();
           if (d.error) return { content: [{ type: 'text' as const, text: `Error: ${d.error}` }], isError: true };
           return {
             content: [{
@@ -1424,7 +1558,7 @@ async function main(): Promise<void> {
           };
         }
       }
-      pendingViewerCommand = null;
+      shared.setViewerCommand(null);
       return { content: [{ type: 'text' as const, text: 'Timed out -- make sure a PDF is open in the viewer.' }], isError: true };
     },
   );
@@ -1457,9 +1591,9 @@ async function main(): Promise<void> {
       inputSchema: {
         searchText: z.string().describe('Text to find'),
         replaceWith: z.string().describe('Replacement text'),
-        page: z.number().int().min(1).optional().describe('Limit to this 1-based page number. Omit to search all pages.'),
-        replaceAll: z.boolean().optional().describe('Replace all occurrences (default: false -- replace only first match)'),
-        caseSensitive: z.boolean().optional().describe('Case-sensitive match (default: true)'),
+        page: z.coerce.number().int().min(1).optional().describe('Limit to this 1-based page number. Omit to search all pages.'),
+        replaceAll: zBool.optional().describe('Replace all occurrences (default: false -- replace only first match)'),
+        caseSensitive: zBool.optional().describe('Case-sensitive match (default: true)'),
       },
     },
     async ({ searchText, replaceWith, page, replaceAll, caseSensitive }) => {
@@ -1509,9 +1643,9 @@ async function main(): Promise<void> {
       annotations: { readOnlyHint: false, destructiveHint: false },
       description: 'Add a bookmark (outline entry) to the currently open PDF pointing to a specific page.',
       inputSchema: {
-        page: z.number().int().min(1).describe('1-based page number the bookmark should point to'),
+        page: z.coerce.number().int().min(1).describe('1-based page number the bookmark should point to'),
         title: z.string().optional().describe('Bookmark label. Defaults to "Page N" if omitted.'),
-        parentPath: z.array(z.number().int().min(0)).optional().describe('Path of 0-based indices to the parent bookmark for nesting, e.g. [0] to nest under the first bookmark. Omit for a top-level bookmark.'),
+        parentPath: z.array(z.coerce.number().int().min(0)).optional().describe('Path of 0-based indices to the parent bookmark for nesting, e.g. [0] to nest under the first bookmark. Omit for a top-level bookmark.'),
       },
     },
     async ({ page, title, parentPath }) =>
@@ -1533,7 +1667,7 @@ async function main(): Promise<void> {
       annotations: { readOnlyHint: false, destructiveHint: false },
       description: 'Delete a bookmark by its tree path. Use read_document_information to see the bookmarks tree first. Path is an array of 0-based indices, e.g. [0] for the first bookmark, [0,1] for the second child of the first bookmark.',
       inputSchema: {
-        path: z.array(z.number().int().min(0)).min(1).describe('0-based path to the bookmark, e.g. [0] or [1,2]'),
+        path: z.array(z.coerce.number().int().min(0)).min(1).describe('0-based path to the bookmark, e.g. [0] or [1,2]'),
       },
     },
     async ({ path }) =>
@@ -1575,7 +1709,7 @@ async function main(): Promise<void> {
       description: 'Extract all raster images embedded in the currently open PDF and save them as a ZIP archive. Returns the path to the saved ZIP file.',
       inputSchema: {
         outputPath: z.string().optional().describe('Where to save the ZIP file. Defaults to the configured default PDF folder (extracted_images.zip).'),
-        pages: z.array(z.number().int().min(1)).optional().describe('1-based page numbers to extract from. Omit to extract from all pages.'),
+        pages: z.array(z.coerce.number().int().min(1)).optional().describe('1-based page numbers to extract from. Omit to extract from all pages.'),
         format: z.enum(['png', 'jpeg']).optional().describe('Image format (default: png)'),
       },
     },
@@ -1628,9 +1762,9 @@ async function main(): Promise<void> {
       inputSchema: {
         preset: z.enum(['A3', 'A4', 'A5', 'Letter', 'Legal', 'Tabloid']).optional()
           .describe('Named page size preset. Ignored if width/height are provided.'),
-        width: z.number().min(1).optional().describe('Page width in PDF points (72 pt = 1 inch). A4 = 595, Letter = 612.'),
-        height: z.number().min(1).optional().describe('Page height in PDF points. A4 = 842, Letter = 792.'),
-        pages: z.array(z.number().int().min(1)).optional().describe('1-based page numbers to resize. Omit to resize all pages.'),
+        width: z.coerce.number().min(1).optional().describe('Page width in PDF points (72 pt = 1 inch). A4 = 595, Letter = 612.'),
+        height: z.coerce.number().min(1).optional().describe('Page height in PDF points. A4 = 842, Letter = 792.'),
+        pages: z.array(z.coerce.number().int().min(1)).optional().describe('1-based page numbers to resize. Omit to resize all pages.'),
       },
     },
     async ({ preset, width, height, pages }) => {
@@ -1667,7 +1801,7 @@ async function main(): Promise<void> {
       annotations: { readOnlyHint: false, destructiveHint: false },
       description: 'Delete one or more pages from the currently open PDF. Provide 1-based page numbers.',
       inputSchema: {
-        pages: z.array(z.number().int().min(1)).min(1).describe('1-based page numbers to delete'),
+        pages: z.array(z.coerce.number().int().min(1)).min(1).describe('1-based page numbers to delete'),
       },
     },
     async ({ pages }) =>
@@ -1689,8 +1823,8 @@ async function main(): Promise<void> {
       annotations: { readOnlyHint: false, destructiveHint: false },
       description: 'Move pages to a different position in the currently open PDF. Use afterPage: 0 to move pages to the beginning.',
       inputSchema: {
-        pages: z.array(z.number().int().min(1)).min(1).describe('1-based page numbers to move'),
-        afterPage: z.number().int().min(0).describe('Insert after this 1-based page number. Use 0 to move to the beginning.'),
+        pages: z.array(z.coerce.number().int().min(1)).min(1).describe('1-based page numbers to move'),
+        afterPage: z.coerce.number().int().min(0).describe('Insert after this 1-based page number. Use 0 to move to the beginning.'),
       },
     },
     async ({ pages, afterPage }) =>
@@ -1713,8 +1847,8 @@ async function main(): Promise<void> {
       annotations: { readOnlyHint: false, destructiveHint: false },
       description: 'Duplicate pages and insert the copies at a specified position in the currently open PDF.',
       inputSchema: {
-        pages: z.array(z.number().int().min(1)).min(1).describe('1-based page numbers to duplicate'),
-        afterPage: z.number().int().min(0).optional().describe('Insert copies after this 1-based page number. Use 0 to insert at the beginning. Omit to append at the end.'),
+        pages: z.array(z.coerce.number().int().min(1)).min(1).describe('1-based page numbers to duplicate'),
+        afterPage: z.coerce.number().int().min(0).optional().describe('Insert copies after this 1-based page number. Use 0 to insert at the beginning. Omit to append at the end.'),
       },
     },
     async ({ pages, afterPage }) =>
@@ -1736,7 +1870,7 @@ async function main(): Promise<void> {
       annotations: { readOnlyHint: false, destructiveHint: false },
       description: 'Reverse the page order of the currently open PDF. Omit pages to reverse the entire document.',
       inputSchema: {
-        pages: z.array(z.number().int().min(1)).optional().describe('1-based page numbers to reverse among themselves. Omit to reverse all pages.'),
+        pages: z.array(z.coerce.number().int().min(1)).optional().describe('1-based page numbers to reverse among themselves. Omit to reverse all pages.'),
       },
     },
     async ({ pages }) =>
@@ -1877,7 +2011,7 @@ async function main(): Promise<void> {
       annotations: { readOnlyHint: true },
       description: 'List all text blocks on a page with their 0-based block index and full text content. Use this before format_text or delete_text_blocks to discover block indices. Page parameter is 1-based.',
       inputSchema: {
-        page: z.number().int().min(1).describe('1-based page number'),
+        page: z.coerce.number().int().min(1).describe('1-based page number'),
       },
     },
     async ({ page }) =>
@@ -1901,16 +2035,16 @@ async function main(): Promise<void> {
       annotations: { readOnlyHint: false, destructiveHint: false },
       description: 'Apply font formatting to a text fragment in the currently open PDF. Finds the text on the page and applies the specified formatting. Use read_page_text_blocks first if the text is not found (PDF text may have unexpected spacing).',
       inputSchema: {
-        page: z.number().int().min(1).describe('1-based page number'),
+        page: z.coerce.number().int().min(1).describe('1-based page number'),
         text: z.string().describe('Exact text fragment to find and format'),
-        occurrence: z.number().int().min(1).optional().describe('Which occurrence to format (default: 1). Ignored when all_occurrences is true.'),
-        all_occurrences: z.boolean().optional().describe('Format ALL occurrences of the text on the page at once (default: false)'),
-        font_size: z.number().positive().optional().describe('Font size in points (e.g. 14)'),
+        occurrence: z.coerce.number().int().min(1).optional().describe('Which occurrence to format (default: 1). Ignored when all_occurrences is true.'),
+        all_occurrences: zBool.optional().describe('Format ALL occurrences of the text on the page at once (default: false)'),
+        font_size: z.coerce.number().positive().optional().describe('Font size in points (e.g. 14)'),
         font_family: z.string().optional().describe('Font family name (e.g. "Arial", "Times New Roman")'),
         font_style: z.enum(['regular', 'bold', 'italic', 'bold_italic']).optional().describe('Font style'),
-        underline: z.boolean().optional().describe('true to add black underline, false to remove underline'),
+        underline: zBool.optional().describe('true to add black underline, false to remove underline'),
         underline_color: z.string().optional().describe('Underline color as hex (e.g. "#0000FF" for blue). Sets underline independently from text color. Use "#00000000" to remove.'),
-        strikeout: z.boolean().optional().describe('true to add black strikethrough, false to remove'),
+        strikeout: zBool.optional().describe('true to add black strikethrough, false to remove'),
         strikeout_color: z.string().optional().describe('Strikethrough color as hex (e.g. "#FF0000" for red). Use "#00000000" to remove.'),
         text_color: z.string().optional().describe('Text color as hex string, e.g. "#FF0000" for red'),
         highlight_color: z.string().optional().describe('Highlight background color as hex, e.g. "#FFFF00" for yellow. Use "#00000000" to remove.'),
@@ -1922,8 +2056,10 @@ async function main(): Promise<void> {
           text_color === undefined && highlight_color === undefined) {
         return nok('Provide at least one formatting option.');
       }
+      const nc = normalizeColors({ underline_color, strikeout_color, text_color, highlight_color });
+      if (!nc.ok) return nok(nc.error);
       return pollViewerResult<{ success: boolean; applied?: number; error?: string }>(
-        { type: 'format_text', page, text, occurrence: occurrence ?? 1, all_occurrences, font_size, font_family, font_style, underline, underline_color, strikeout, strikeout_color, text_color, highlight_color },
+        { type: 'format_text', page, text, occurrence: occurrence ?? 1, all_occurrences, font_size, font_family, font_style, underline, strikeout, ...nc.colors },
         'format_text',
         15_000,
         (d) => {
@@ -1950,13 +2086,13 @@ async function main(): Promise<void> {
       annotations: { readOnlyHint: false, destructiveHint: false },
       description: 'Add a plain text label to a page in the currently open PDF. Position and size are percentages of page dimensions. Use this to add labels, headers, or descriptions before adding form fields below them.',
       inputSchema: {
-        page: z.number().int().min(1).describe('1-based page number'),
+        page: z.coerce.number().int().min(1).describe('1-based page number'),
         text: z.string().describe('Text content to display'),
-        x: z.number().min(0).max(100).describe('Left position as % of page width'),
-        y: z.number().min(0).max(100).describe('Top position as % of page height'),
-        width: z.number().min(0).max(100).describe('Width as % of page width'),
-        height: z.number().min(0).max(100).describe('Height as % of page height'),
-        font_size: z.number().positive().optional().describe('Font size in points (default 11)'),
+        x: z.coerce.number().min(0).max(100).describe('Left position as % of page width'),
+        y: z.coerce.number().min(0).max(100).describe('Top position as % of page height'),
+        width: z.coerce.number().min(0).max(100).describe('Width as % of page width'),
+        height: z.coerce.number().min(0).max(100).describe('Height as % of page height'),
+        font_size: z.coerce.number().positive().optional().describe('Font size in points (default 11)'),
       },
     },
     async ({ page, text, x, y, width, height, font_size }) =>
@@ -1978,12 +2114,12 @@ async function main(): Promise<void> {
       annotations: { readOnlyHint: false, destructiveHint: false },
       description: 'Add a fillable form field (AcroForm widget) to a page in the currently open PDF. Position and size are percentages of page dimensions (0--100). Use x=0, width=100 to span the full page width.',
       inputSchema: {
-        page: z.number().int().min(1).describe('1-based page number'),
+        page: z.coerce.number().int().min(1).describe('1-based page number'),
         field_type: z.enum(['text', 'checkbox', 'radio', 'dropdown', 'listbox', 'button']).describe('Field type'),
-        x: z.number().min(0).max(100).describe('Left position as % of page width'),
-        y: z.number().min(0).max(100).describe('Top position as % of page height'),
-        width: z.number().min(0).max(100).describe('Width as % of page width (use 100 for full-width)'),
-        height: z.number().min(0).max(100).describe('Height as % of page height'),
+        x: z.coerce.number().min(0).max(100).describe('Left position as % of page width'),
+        y: z.coerce.number().min(0).max(100).describe('Top position as % of page height'),
+        width: z.coerce.number().min(0).max(100).describe('Width as % of page width (use 100 for full-width)'),
+        height: z.coerce.number().min(0).max(100).describe('Height as % of page height'),
         label: z.string().optional().describe('Caption / label text shown on the field'),
         default_value: z.string().optional().describe('Initial field value'),
         options: z.array(z.string()).optional().describe('Choice options for dropdown/listbox fields'),
@@ -1991,16 +2127,19 @@ async function main(): Promise<void> {
         border_color: z.string().optional().describe('Border color hex e.g. #000000'),
       },
     },
-    async ({ page, field_type, x, y, width, height, label, default_value, options, bg_color, border_color }) =>
-      pollViewerResult<{ success: boolean; field_name?: string | null; error?: string }>(
-        { type: 'add_form_field', page, field_type, x, y, width, height, label: label ?? null, default_value: default_value ?? null, options: options ?? null, bg_color: bg_color ?? null, border_color: border_color ?? null },
+    async ({ page, field_type, x, y, width, height, label, default_value, options, bg_color, border_color }) => {
+      const nc = normalizeColors({ bg_color, border_color });
+      if (!nc.ok) return nok(nc.error);
+      return pollViewerResult<{ success: boolean; field_name?: string | null; error?: string }>(
+        { type: 'add_form_field', page, field_type, x, y, width, height, label: label ?? null, default_value: default_value ?? null, options: options ?? null, bg_color: nc.colors.bg_color ?? null, border_color: nc.colors.border_color ?? null },
         'add_form_field',
         15_000,
         (d) => {
           if (!d.success) return nok(`Error: ${d.error}`);
           return ok(`Form field added to page ${page}${d.field_name ? ` (field name: "${d.field_name}")` : ''}.`);
         },
-      ),
+      );
+    },
   );
 
   server.registerTool(
@@ -2093,7 +2232,7 @@ async function main(): Promise<void> {
       description: 'Remove page numbers from the currently open PDF. Omit both range and pages to remove from all pages.',
       inputSchema: {
         range: z.array(z.string()).optional().describe('Page range strings, e.g. ["all"] or ["1-3","5"]. Omit to target all pages.'),
-        pages: z.array(z.number().int().min(1)).optional().describe('Specific 1-based page numbers to target. Omit to use range.'),
+        pages: z.array(z.coerce.number().int().min(1)).optional().describe('Specific 1-based page numbers to target. Omit to use range.'),
       },
     },
     async ({ range, pages }) =>
@@ -2115,8 +2254,8 @@ async function main(): Promise<void> {
       annotations: { readOnlyHint: false, destructiveHint: false },
       description: 'Delete one or more editable text blocks from a page in the currently open PDF. Use read_page_text_blocks first to get 0-based block indices. Page is 1-based (same as all other tools).',
       inputSchema: {
-        page: z.number().int().min(1).describe('1-based page number (same as all other tools).'),
-        block_indices: z.array(z.number().int().min(0)).min(1).describe('0-based block indices to delete -- use read_page_text_blocks to get them.'),
+        page: z.coerce.number().int().min(1).describe('1-based page number (same as all other tools).'),
+        block_indices: z.array(z.coerce.number().int().min(0)).min(1).describe('0-based block indices to delete -- use read_page_text_blocks to get them.'),
       },
     },
     async ({ page, block_indices }) =>
@@ -2239,17 +2378,17 @@ async function main(): Promise<void> {
           .describe('Owner (permissions) password. Required to restrict what others can do with the document.'),
         encryption: z.enum(['RC4-40', 'RC4-128', 'AES-128', 'AES-256']).optional()
           .describe('Encryption algorithm. RC4-40 and RC4-128 are legacy; prefer AES-128 or AES-256 (default).'),
-        allow_printing: z.boolean().optional()
+        allow_printing: zBool.optional()
           .describe('Allow printing the document (default: true). Set false to disable printing entirely.'),
-        allow_copying: z.boolean().optional()
+        allow_copying: zBool.optional()
           .describe('Allow copying text and images (default: true). Set false to prevent copy-paste.'),
-        allow_editing: z.boolean().optional()
+        allow_editing: zBool.optional()
           .describe('Allow editing page content (default: true). Set false to make content read-only.'),
-        allow_annotations: z.boolean().optional()
+        allow_annotations: zBool.optional()
           .describe('Allow adding or editing annotations and comments (default: true).'),
-        allow_forms: z.boolean().optional()
+        allow_forms: zBool.optional()
           .describe('Allow filling form fields (default: true). Set false to lock all form fields.'),
-        perm_flags: z.number().int().optional()
+        perm_flags: z.coerce.number().int().optional()
           .describe('Advanced: raw PDF permission-flags bitmask (overrides all allow_* options). Bits: 0x04=print, 0x08=edit, 0x10=copy, 0x20=annotations, 0x100=forms, 0x800=high-res print.'),
       },
     },
@@ -2295,8 +2434,8 @@ async function main(): Promise<void> {
       description: 'Find all occurrences of the specified text in the currently open PDF, mark them as redaction annotations, and permanently apply the redactions. Use this to remove sensitive information by its text content.',
       inputSchema: {
         text: z.string().describe('Text to search for and redact.'),
-        case_sensitive: z.boolean().optional().describe('Case-sensitive search (default: false).'),
-        whole_word: z.boolean().optional().describe('Match whole words only (default: false).'),
+        case_sensitive: zBool.optional().describe('Case-sensitive search (default: false).'),
+        whole_word: zBool.optional().describe('Match whole words only (default: false).'),
       },
     },
     async ({ text, case_sensitive, whole_word }) =>
@@ -2344,12 +2483,12 @@ async function main(): Promise<void> {
         font_family: z.string().optional().describe(
           'Font family name. Examples: "Arial", "Times New Roman", "Courier", "Helvetica", "Georgia". Default: "Arial".'
         ),
-        font_size: z.number().optional().describe('Font size in points. Common values: 8, 10, 12, 14. Default: 12.'),
+        font_size: z.coerce.number().optional().describe('Font size in points. Common values: 8, 10, 12, 14. Default: 12.'),
         font_color: z.string().optional().describe('Font color as hex string. Examples: "#000000" (black), "#FF0000" (red), "#0000FF" (blue), "#808080" (gray). Default: "#000000".'),
         range: z.array(z.string()).optional().describe(
           'Page ranges to add numbers to. Examples: ["all"] (all pages), ["1-5"] (first 5), ["1-3","7","10-12"]. Omit = all pages.'
         ),
-        start_number: z.number().int().min(1).optional().describe(
+        start_number: z.coerce.number().int().min(1).optional().describe(
           'The number displayed on the first numbered page. Default: 1. Use e.g. 5 if the document continues from a previous file.'
         ),
       },
@@ -2360,8 +2499,10 @@ async function main(): Promise<void> {
         'bottom-center': 4, 'bottom-left': 5, 'top-left': 7,
       };
       const positionValue = position ? (positionMap[position] ?? 4) : 4;
+      const nc = normalizeColors({ font_color });
+      if (!nc.ok) return nok(nc.error);
       return pollViewerResult<{ success: boolean; error?: string }>(
-        { type: 'insert_page_number', fontFamily: font_family ?? 'Arial', fontSize: font_size ?? 12, fontColor: font_color ?? '#000000', format: format ?? '%1%', position: positionValue, range: range ?? null, startNumber: start_number ?? 1 },
+        { type: 'insert_page_number', fontFamily: font_family ?? 'Arial', fontSize: font_size ?? 12, fontColor: nc.colors.font_color ?? '#000000', format: format ?? '%1%', position: positionValue, range: range ?? null, startNumber: start_number ?? 1 },
         'insert_page_number',
         15_000,
         (d) => {
@@ -2383,7 +2524,7 @@ async function main(): Promise<void> {
     },
     async () => {
       return {
-        content: [{ type: 'text' as const, text: JSON.stringify({ open: pendingOpenTarget }) }],
+        content: [{ type: 'text' as const, text: JSON.stringify({ open: shared.getOpenTarget() }) }],
       };
     },
   );
@@ -2400,10 +2541,15 @@ async function main(): Promise<void> {
     },
     async ({ token }) => {
       const key = token ?? '';
-      const allow = !fullscreenGrantedTokens.has(key);
+      // Re-read from disk on every claim instead of trusting the Set loaded at
+      // startup: in Cowork mode sibling server instances each have their own
+      // process, so a grant recorded by one instance must be visible to the
+      // others (same cross-instance issue as shared-state.ts).
+      const granted = loadFullscreenGrantedTokens();
+      const allow = !granted.has(key);
       if (allow) {
-        fullscreenGrantedTokens.add(key);
-        saveFullscreenGrantedTokens(fullscreenGrantedTokens);
+        granted.add(key);
+        saveFullscreenGrantedTokens(granted);
       }
       return {
         content: [{ type: 'text' as const, text: JSON.stringify({ allow }) }],
@@ -2421,11 +2567,10 @@ async function main(): Promise<void> {
       _meta: { ui: { resourceUri, visibility: ['app'] as const } },
     },
     async () => {
-      if (_pendingDocOpen) {
+      if (shared.isDocOpenPending()) {
         return { content: [{ type: 'text' as const, text: JSON.stringify({ command: null }) }] };
       }
-      const cmd = pendingViewerCommand;
-      pendingViewerCommand = null;
+      const cmd = shared.takeViewerCommand();
       return {
         content: [{ type: 'text' as const, text: JSON.stringify({ command: cmd }) }],
       };
@@ -2441,17 +2586,17 @@ async function main(): Promise<void> {
       description: 'Report a result from the viewer to the server (internal)',
       inputSchema: {
         type: z.string(),
-        count: z.number().int().min(0).optional(),
-        pages: z.array(z.number().int().min(1)).optional(),
+        count: z.coerce.number().int().min(0).optional(),
+        pages: z.array(z.coerce.number().int().min(1)).optional(),
         json: z.string().optional(),
       },
       _meta: { ui: { resourceUri, visibility: ['app'] as const } },
     },
     async ({ type, count, pages, json }) => {
       if (type === 'doc_opened') {
-        _pendingDocOpen = false;
+        shared.setDocOpenPending(false);
       } else if (type === 'search') {
-        pendingSearchResult = { count: count ?? 0, pages: pages ?? [] };
+        shared.setSearchResult({ count: count ?? 0, pages: pages ?? [] });
       } else if (type === 'auto_save') {
         // RDB-7843: a side-channel note from the isModified-driven safety-net
         // save (mcp-app.ts's watchDocumentModifications) — not a poll target
@@ -2460,19 +2605,19 @@ async function main(): Promise<void> {
         // in-flight pollViewerResult() is still waiting to see.
         try {
           const parsed = json ? JSON.parse(json) : null;
-          if (parsed?.path) _lastWorkingFile = parsed.path;
+          if (parsed?.path) shared.updateDocState({ lastWorkingFile: parsed.path });
         } catch { /* ignore malformed note */ }
       } else if (json !== undefined) {
         try {
           const parsed = JSON.parse(json);
           if (parsed._pageCount != null) {
             const cp = parsed._currentPage != null ? `page ${parsed._currentPage} of ` : '';
-            _lastDocState = `${cp}${parsed._pageCount} pages`;
+            shared.updateDocState({ lastDocState: `${cp}${parsed._pageCount} pages` });
           }
-          if (parsed._workingFile) _lastWorkingFile = parsed._workingFile;
-          pendingViewerResult = { type, data: parsed };
+          if (parsed._workingFile) shared.updateDocState({ lastWorkingFile: parsed._workingFile });
+          shared.setViewerResult({ type, data: parsed });
         } catch {
-          pendingViewerResult = { type, data: json };
+          shared.setViewerResult({ type, data: json });
         }
       }
       return { content: [{ type: 'text' as const, text: 'ok' }] };
