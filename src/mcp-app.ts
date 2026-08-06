@@ -887,8 +887,7 @@ let editorReady: Promise<ViewerResult> | null = null;
 // the host reports our real allocated size asynchronously (after PdfEditor()
 // is already constructed), and that initial fit-zoom never recomputes once
 // our container grows. Force a sane, predictable 100% zoom right after each
-// document loads instead of trusting the auto-fit. Also force single-page
-// layout (RDB-7720) instead of the vendor's continuous-scroll default.
+// document loads instead of trusting the auto-fit.
 // Bounded window (ms) during which we fight the vendor's own auto-fit
 // recompute on every container resize (see applyDefaultViewSettings below).
 // Past this we stop, so a manual zoom the user makes later isn't fought.
@@ -904,11 +903,14 @@ function applyDefaultViewSettings(docVm: any): void {
   // setLayout first: switching layout mode can reset the page-view fit mode
   // back to its own default, so it must not run after — and thereby undo —
   // the actual-size + forced zoom below.
-  try { docVm?.setLayout?.('single'); } catch (_) { /* non-fatal */ }
-  // Single-page layout renders through an auto-fit page view (fit-page /
-  // fit-width) that recomputes against the container size — the same
-  // "tiny container at construction time" problem this function's zoom
-  // override already exists to work around, just on a different axis.
+  //
+  // 'continuous' = single-page view WITH scrolling in the vendor's view-mode
+  // map (its "Enable scrolling" menu toggle switches single <-> continuous).
+  // RDB-7720 originally forced 'single' (no scrolling) here; reverted per the
+  // design decision on the ticket — the mobile/tablet web-app versions won't
+  // be redesigned, so scrolling must be enabled by default. Set explicitly
+  // rather than relying on the vendor default so this survives vendor bumps.
+  try { docVm?.setLayout?.('continuous'); } catch (_) { /* non-fatal */ }
   // actualSize tells the viewer to honor our explicit zoom instead of
   // auto-fitting, otherwise setZoom() below is silently ignored.
   const forceActualSizeZoom = () => {
