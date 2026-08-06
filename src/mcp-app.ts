@@ -1404,6 +1404,17 @@ function startViewerCommandPoller(): void {
   }, 800);
 }
 
+// Report a handler failure back to the server so its pollViewerResult-based
+// tool returns the real error to the model instead of sitting out its timeout.
+// Success-only reporting was how "add a green square" could fail in the viewer
+// while the model confidently told the user it was done (RDB-7878).
+async function reportFailure(type: string, err: unknown): Promise<void> {
+  await (app as any).callServerTool({
+    name: 'report_viewer_result',
+    arguments: { type, json: JSON.stringify({ success: false, error: err instanceof Error ? err.message : String(err) }) },
+  }).catch(() => {});
+}
+
 async function handleRotatePages(data: { angle: number; pages: number[] | null }): Promise<void> {
   try {
     show('Rotating pages…');
@@ -1427,6 +1438,7 @@ async function handleRotatePages(data: { angle: number; pages: number[] | null }
     }).catch(() => {});
   } catch (err) {
     show(`Rotate error: ${err instanceof Error ? err.message : String(err)}`, true);
+    await reportFailure('rotate_pages', err);
   }
 }
 
@@ -1468,6 +1480,7 @@ async function handleInsertBlankPage(data: { afterPage: number | null }): Promis
     }).catch(() => {});
   } catch (err) {
     show(`Insert page error: ${err instanceof Error ? err.message : String(err)}`, true);
+    await reportFailure('insert_blank_page', err);
   }
 }
 
@@ -1486,8 +1499,7 @@ async function handleAddImageToPage(data: {
     const pages = doc.getPages() as Array<{ width?: number; height?: number }>;
     const pageIndex = data.page - 1;
     if (pageIndex < 0 || pageIndex >= pages.length) {
-      show(`Error: page ${data.page} out of range`, true);
-      return;
+      throw new Error(`page ${data.page} out of range (document has ${pages.length} pages)`);
     }
     const page = pages[pageIndex];
     const pw = page?.width ?? 595;
@@ -1567,6 +1579,7 @@ async function handleAddImageToPage(data: {
     }).catch(() => {});
   } catch (err) {
     show(`Add image error: ${err instanceof Error ? err.message : String(err)}`, true);
+    await reportFailure('add_image_to_page', err);
   }
 }
 
@@ -1583,8 +1596,7 @@ async function handleAddAnnotation(data: AnnotationCommand): Promise<void> {
     const pages = (doc.getPages() as unknown[]);
     const pageIndex = data.page - 1;
     if (pageIndex < 0 || pageIndex >= pages.length) {
-      show(`Error: page ${data.page} out of range`, true);
-      return;
+      throw new Error(`page ${data.page} out of range (document has ${pages.length} pages)`);
     }
     const page = pages[pageIndex] as { width?: number; height?: number };
     const pw = page.width || 595;
@@ -1628,6 +1640,7 @@ async function handleAddAnnotation(data: AnnotationCommand): Promise<void> {
     }).catch(() => {});
   } catch (err) {
     show(`Annotation error: ${err instanceof Error ? err.message : String(err)}`, true);
+    await reportFailure('add_annotation', err);
   }
 }
 
@@ -1868,6 +1881,7 @@ async function handleGetViewState(): Promise<void> {
     });
   } catch (err) {
     show(`get_view_state error: ${err instanceof Error ? err.message : String(err)}`, true);
+    await reportFailure('view_state', err);
   }
 }
 
