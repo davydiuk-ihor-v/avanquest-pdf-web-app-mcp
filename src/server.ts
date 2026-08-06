@@ -584,7 +584,7 @@ async function main(): Promise<void> {
       title: 'Display PDF',
       annotations: { readOnlyHint: false, destructiveHint: false },
       description:
-        'Open a PDF in the embedded Avanquest PDF viewer. Pass either an absolute local path to a .pdf file inside the user\'s document folders, or a URL to a remote PDF. The viewer renders inline in the chat.',
+        'Open a PDF in the embedded Avanquest PDF editor. Pass either an absolute local path to a .pdf file inside the user\'s document folders, or a URL to a remote PDF. The viewer renders inline in the chat.',
       inputSchema: {
         path: z.string().optional().describe("Absolute path to a PDF file within the user's allowed document folders"),
         url: z.string().optional().describe('URL of a remote PDF to download and open (http or https)'),
@@ -647,7 +647,7 @@ async function main(): Promise<void> {
       shared.setOpenTarget(structured);
       return {
         content: [
-          { type: 'text', text: `Opened ${name} in the viewer.` },
+          { type: 'text', text: `Opened ${name} in the editor.` },
           openTargetContentBlock(structured),
         ],
         structuredContent: structured,
@@ -743,7 +743,7 @@ async function main(): Promise<void> {
     {
       title: 'Compress PDF',
       annotations: { destructiveHint: true },
-      description: 'Open a PDF in the viewer and compress it. Accepts path (required), compression (min/low/medium/high/max, default: medium), and optional outputPath. The viewer performs compression using the browser-side PDF engine.',
+      description: 'Open a PDF in the editor and compress it. Accepts path (required), compression (min/low/medium/high/max, default: medium), and optional outputPath. The editor performs compression using the browser-side PDF engine.',
       inputSchema: {
         path: z.string().describe("Absolute path to a PDF file within the user's allowed document folders"),
         compression: z.enum(['min', 'low', 'medium', 'high', 'max'])
@@ -794,7 +794,7 @@ async function main(): Promise<void> {
     {
       title: 'Merge PDFs',
       annotations: { destructiveHint: true },
-      description: 'Open the first PDF in the viewer and merge all listed PDFs into one. Accepts paths (array of absolute PDF paths, min 2) and optional outputPath.',
+      description: 'Open the first PDF in the editor and merge all listed PDFs into one. Accepts paths (array of absolute PDF paths, min 2) and optional outputPath.',
       inputSchema: {
         paths: z.array(z.string()).min(2).describe('Absolute paths to PDF files to merge, in order'),
         outputPath: z.string().optional().describe('Where to save the merged file. Defaults to <firstName>_merged.pdf next to the first file'),
@@ -847,7 +847,7 @@ async function main(): Promise<void> {
     {
       title: 'Split PDF',
       annotations: { destructiveHint: true },
-      description: 'Open a PDF in the viewer and split it into multiple files by page ranges or equal chunks.',
+      description: 'Open a PDF in the editor and split it into multiple files by page ranges or equal chunks.',
       inputSchema: {
         path: z.string().describe("Absolute path to the PDF file to split"),
         ranges: z.array(z.string()).optional().describe('Page ranges for each output file, e.g. ["1-3","4-6","7"]. Supports ranges (1-3), comma lists (1,3,5), or single pages (2).'),
@@ -1002,7 +1002,7 @@ async function main(): Promise<void> {
       }
     }
     shared.setViewerCommand(null);
-    return nok('Timed out -- make sure a PDF is open in the viewer.');
+    return nok('Timed out -- make sure a PDF is open in the editor.');
   }
 
   server.registerTool(
@@ -1010,7 +1010,7 @@ async function main(): Promise<void> {
     {
       title: 'Search in PDF',
       annotations: { readOnlyHint: true },
-      description: 'Search for text in the currently open PDF. Highlights all matches in the viewer and returns the total match count and 1-based page numbers where matches were found. The returned page numbers can be used directly in tools that accept a "page" parameter.',
+      description: 'Search for text in the currently open PDF. Highlights all matches in the editor and returns the total match count and 1-based page numbers where matches were found. The returned page numbers can be used directly in tools that accept a "page" parameter.',
       inputSchema: {
         query: z.string().describe('Text to search for'),
         caseSensitive: zBool.optional().describe('Case-sensitive search (default: false)'),
@@ -1041,7 +1041,7 @@ async function main(): Promise<void> {
             content: [
               {
                 type: 'text' as const,
-                text: `Found ${sr.count} match${sr.count === 1 ? '' : 'es'} for "${query}" on page${sr.pages.length === 1 ? '' : 's'} ${pageList}. All matches are highlighted in the viewer.`,
+                text: `Found ${sr.count} match${sr.count === 1 ? '' : 'es'} for "${query}" on page${sr.pages.length === 1 ? '' : 's'} ${pageList}. All matches are highlighted in the editor.`,
               },
             ],
           };
@@ -1049,7 +1049,7 @@ async function main(): Promise<void> {
       }
       shared.setViewerCommand(null);
       return {
-        content: [{ type: 'text' as const, text: 'Search timed out -- make sure a PDF is open in the viewer.' }],
+        content: [{ type: 'text' as const, text: 'Search timed out -- make sure a PDF is open in the editor.' }],
         isError: true,
       };
     },
@@ -1060,7 +1060,7 @@ async function main(): Promise<void> {
     {
       title: 'Navigate Search Result',
       annotations: { readOnlyHint: true },
-      description: 'Navigate to the next or previous search result in the currently open PDF viewer. Requires search_in_pdf to have been called first.',
+      description: 'Navigate to the next or previous search result in the currently open PDF editor. Requires search_in_pdf to have been called first.',
       inputSchema: {
         direction: z.enum(['next', 'prev']).describe('Navigate to next or previous match'),
       },
@@ -1078,7 +1078,7 @@ async function main(): Promise<void> {
     {
       title: 'Rotate Pages',
       annotations: { readOnlyHint: false, destructiveHint: false },
-      description: 'Rotate pages in the currently open PDF viewer. Use pages for specific 1-based page numbers (e.g. [1,3]), or omit to rotate all pages. Angle: 90, 180, or 270 degrees clockwise (negative values rotate counter-clockwise).' + RELAY_SAVE_NOTE_INSTRUCTION,
+      description: 'Rotate pages in the currently open PDF editor. Use pages for specific 1-based page numbers (e.g. [1,3]), or omit to rotate all pages. Angle: 90, 180, or 270 degrees clockwise (negative values rotate counter-clockwise).' + RELAY_SAVE_NOTE_INSTRUCTION,
       inputSchema: {
         // Was z.union([z.literal(90), ...]) — models routinely send "90" as a
         // string or -90 for counter-clockwise, and strict literal validation
@@ -1185,7 +1185,7 @@ async function main(): Promise<void> {
     {
       title: 'Get Selection Info',
       annotations: { readOnlyHint: true },
-      description: 'Read information about the currently selected text in the PDF viewer: the selected text content and its font attributes (family, size, style, colors). Use this before format_selected_text to see what is selected.',
+      description: 'Read information about the currently selected text in the PDF editor: the selected text content and its font attributes (family, size, style, colors). Use this before format_selected_text to see what is selected.',
       inputSchema: {},
     },
     async () =>
@@ -1195,7 +1195,7 @@ async function main(): Promise<void> {
         5_000,
         (d) => {
           if (d.error) return nok(`Error: ${d.error}`);
-          if (!d.hasSelection) return ok('No text is currently selected in the viewer.');
+          if (!d.hasSelection) return ok('No text is currently selected in the editor.');
           const font = d.fontAttributes as Record<string, unknown> | null;
           const styleNames: Record<number, string> = { 0: 'regular', 1: 'italic', 2: 'bold', 3: 'bold-italic' };
           const parts: string[] = [];
@@ -1219,7 +1219,7 @@ async function main(): Promise<void> {
     {
       title: 'Format Selected Text',
       annotations: { readOnlyHint: false, destructiveHint: false },
-      description: 'Apply font formatting to the currently selected text in the PDF viewer. The user must first select text manually in the viewer (by dragging the mouse over text while search is active). Call get_selection_info first to confirm what is selected.',
+      description: 'Apply font formatting to the currently selected text in the PDF editor. The user must first select text manually in the editor (by dragging the mouse over text while search is active). Call get_selection_info first to confirm what is selected.',
       inputSchema: {
         font_family: z.string().optional().describe('Font family name, e.g. "Helvetica", "Arial", "Times New Roman"'),
         font_size: z.coerce.number().min(1).max(500).optional().describe('Font size in points, e.g. 12'),
@@ -1250,7 +1250,7 @@ async function main(): Promise<void> {
     {
       title: 'Reset Selection',
       annotations: { readOnlyHint: false, destructiveHint: false },
-      description: 'Clear the current text selection in the PDF viewer (remove the blue highlight from selected text). Call this after get_selection_info or format_selected_text when the selection is no longer needed.',
+      description: 'Clear the current text selection in the PDF editor (remove the blue highlight from selected text). Call this after get_selection_info or format_selected_text when the selection is no longer needed.',
       inputSchema: {},
     },
     async () =>
@@ -1353,7 +1353,7 @@ async function main(): Promise<void> {
     {
       title: 'Close Document',
       annotations: { readOnlyHint: false, destructiveHint: false },
-      description: 'Close the currently open document in the PDF viewer.',
+      description: 'Close the currently open document in the PDF editor.',
     },
     async () => {
       shared.setViewerCommand({ type: 'close_document' });
@@ -1559,7 +1559,7 @@ async function main(): Promise<void> {
         }
       }
       shared.setViewerCommand(null);
-      return { content: [{ type: 'text' as const, text: 'Timed out -- make sure a PDF is open in the viewer.' }], isError: true };
+      return { content: [{ type: 'text' as const, text: 'Timed out -- make sure a PDF is open in the editor.' }], isError: true };
     },
   );
 
@@ -2635,7 +2635,7 @@ async function main(): Promise<void> {
         title: 'PWV Diagnostics',
         annotations: { readOnlyHint: false, destructiveHint: false },
         description:
-          'Render a diagnostics panel that tests what the MCP Apps sandbox allows (workers, wasm, localhost network). For debugging the PDF viewer extension.',
+          'Render a diagnostics panel that tests what the MCP Apps sandbox allows (workers, wasm, localhost network). For debugging the PDF editor extension.',
         inputSchema: {},
         _meta: { ui: { resourceUri: diagResourceUri } },
       },
@@ -2653,7 +2653,7 @@ async function main(): Promise<void> {
       'PWV Diagnostics',
       diagResourceUri,
       {
-        description: 'Sandbox capability diagnostics for the Avanquest PDF viewer extension.',
+        description: 'Sandbox capability diagnostics for the Avanquest PDF editor extension.',
         _meta: { ui: { csp: { resourceDomains: [baseUrl], connectDomains: [baseUrl] } } },
       },
       async () => {
@@ -2674,10 +2674,10 @@ async function main(): Promise<void> {
 
   registerAppResource(
     server,
-    'Avanquest PDF Viewer',
+    'Avanquest PDF Editor',
     resourceUri,
     {
-      description: 'Interactive PDF viewer powered by @avanquest/pdf-web-viewer.',
+      description: 'Interactive PDF editor powered by @avanquest/pdf-web-viewer.',
       _meta: {
         ui: {
           csp: {
