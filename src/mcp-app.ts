@@ -182,12 +182,26 @@ try {
   /* ignore if property is non-configurable */
 }
 
+// Known-benign vendor teardown race: the in-viewer merge dialog's onDestroy
+// removes a document whose worker entry was already disposed when the merged
+// result replaced it — closeFile() then throws "Web Worker not found." from
+// deep inside the vendor bundle with nothing above it to catch. The merge
+// itself completes fine; surfacing this as a full-width error overlay is pure
+// noise, so log it via beacon and swallow. Errors this suppresses are by
+// definition UNHANDLED leftovers — any operation that genuinely fails on a
+// missing worker still reports through its own catch/report path.
+function isBenignVendorError(msg: string): boolean {
+  return msg.includes('Clipboard') || msg.includes('clipboard')
+    || msg.includes('Web Worker not found');
+}
+
 window.addEventListener('error', (e) => {
+  if (isBenignVendorError(e.message ?? '')) { beacon(`suppressed window.error: ${e.message}`); return; }
   show(`window.error: ${e.message}\n${e.filename}:${e.lineno}:${e.colno}`, true);
 });
 window.addEventListener('unhandledrejection', (e) => {
   const msg = e.reason instanceof Error ? e.reason.message : String(e.reason);
-  if (msg.includes('Clipboard') || msg.includes('clipboard')) { e.preventDefault(); return; }
+  if (isBenignVendorError(msg)) { beacon(`suppressed unhandledrejection: ${msg}`); e.preventDefault(); return; }
   const reason = e.reason instanceof Error ? `${e.reason.message}\n${e.reason.stack}` : String(e.reason);
   show(`unhandledrejection: ${reason}`, true);
 });
