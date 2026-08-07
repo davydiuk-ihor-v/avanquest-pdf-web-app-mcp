@@ -2996,11 +2996,14 @@ async function handleDeleteBatesNumbering(): Promise<void> {
   }
 }
 
-async function handleDeleteWatermark(data: { range: string[] }): Promise<void> {
+async function handleDeleteWatermark(data: { range: string[] | null }): Promise<void> {
   try {
     const doc = (_currentDocumentView as any)?.getDocument?.();
     if (!doc) throw new Error('document not available');
-    await (doc as any).deleteWatermark({ range: data.range });
+    // null range = whole document (the server normalizes ["all"] to null,
+    // RDB-7893) — expand to an explicit 1-N, the only form the engine parses.
+    const range = data.range && data.range.length > 0 ? data.range : [`1-${(doc as any).getNumPages?.() ?? 1}`];
+    await (doc as any).deleteWatermark({ range });
     show('Watermark removed');
     setTimeout(() => { statusEl.style.display = 'none'; }, 2000);
     await (app as any).callServerTool({
@@ -3018,11 +3021,13 @@ async function handleDeleteWatermark(data: { range: string[] }): Promise<void> {
   }
 }
 
-async function handleDeleteHeader(data: { range: string[] }): Promise<void> {
+async function handleDeleteHeader(data: { range: string[] | null }): Promise<void> {
   try {
     const doc = (_currentDocumentView as any)?.getDocument?.();
     if (!doc) throw new Error('document not available');
-    await (doc as any).deleteHeader({ range: data.range });
+    // See handleDeleteWatermark: null = whole document, expand to 1-N.
+    const range = data.range && data.range.length > 0 ? data.range : [`1-${(doc as any).getNumPages?.() ?? 1}`];
+    await (doc as any).deleteHeader({ range });
     show('Headers/footers removed');
     setTimeout(() => { statusEl.style.display = 'none'; }, 2000);
     await (app as any).callServerTool({
@@ -3145,12 +3150,14 @@ async function handleConvertToImages(data: { dpi: number | null; outputPath: str
   }
 }
 
-async function handleExtractPages(data: { Range: string[]; outputPath: string }): Promise<void> {
+async function handleExtractPages(data: { Range: string[] | null; outputPath: string }): Promise<void> {
   try {
     showSaveProgress('Extracting pages');
     const doc = (_currentDocumentView as any)?.getDocument?.();
     if (!doc) throw new Error('document not available');
-    const raw = await (doc as any).extractPages({ Range: data.Range });
+    // See handleDeleteWatermark: null = whole document, expand to 1-N.
+    const Range = data.Range && data.Range.length > 0 ? data.Range : [`1-${(doc as any).getNumPages?.() ?? 1}`];
+    const raw = await (doc as any).extractPages({ Range });
     const bytes = new Uint8Array(raw instanceof ArrayBuffer ? raw : (raw as ArrayBufferView).buffer);
     await saveChunked(bytes, data.outputPath, 'Saving extracted PDF');
     showSaveSuccess('Pages extracted successfully', data.outputPath);

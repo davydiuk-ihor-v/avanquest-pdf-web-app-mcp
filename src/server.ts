@@ -214,6 +214,20 @@ function normalizeShape(value: string, allowed: readonly string[]): string | nul
   return allowed.includes(mapped) ? mapped : null;
 }
 
+// RDB-7898 / RDB-7893: the range descriptions document ["all"] and models do
+// send it — but the engine's range parser only understands numeric forms
+// ("1-3", "5") and treats "all" as an empty range ("'pages' is an empty
+// range"). Strip "all"-style entries here; a null result tells the widget to
+// expand to the document's full 1-N range (only the widget knows the page
+// count — the server never has the document open).
+function normalizeRangeList(range: string[] | undefined | null): string[] | null {
+  if (!range) return null;
+  const cleaned = range
+    .map((r) => String(r).trim())
+    .filter((r) => r && !['all', 'all pages', '*'].includes(r.toLowerCase()));
+  return cleaned.length > 0 ? cleaned : null;
+}
+
 const CSS_COLOR_NAMES: Record<string, string> = {
   black: '#000000', white: '#FFFFFF', red: '#FF0000', green: '#00AA00',
   lime: '#00FF00', blue: '#0000FF', yellow: '#FFFF00', orange: '#FF6600',
@@ -2192,7 +2206,7 @@ async function main(): Promise<void> {
     },
     async ({ range }) =>
       pollViewerResult<{ success: boolean; error?: string }>(
-        { type: 'delete_watermark', range },
+        { type: 'delete_watermark', range: normalizeRangeList(range) },
         'delete_watermark',
         10_000,
         (d) => {
@@ -2214,7 +2228,7 @@ async function main(): Promise<void> {
     },
     async ({ range }) =>
       pollViewerResult<{ success: boolean; error?: string }>(
-        { type: 'delete_header', range },
+        { type: 'delete_header', range: normalizeRangeList(range) },
         'delete_header',
         10_000,
         (d) => {
@@ -2237,7 +2251,7 @@ async function main(): Promise<void> {
     },
     async ({ range, pages }) =>
       pollViewerResult<{ success: boolean; error?: string }>(
-        { type: 'delete_page_number', range: range ?? null, pages: pages ?? null },
+        { type: 'delete_page_number', range: normalizeRangeList(range), pages: pages ?? null },
         'delete_page_number',
         10_000,
         (d) => {
@@ -2316,7 +2330,7 @@ async function main(): Promise<void> {
       const defaultDir = DEFAULT_PDF_DIR;
       const savePath = output_path?.trim() || path.join(defaultDir, file_name?.trim() || 'extracted_pages.pdf');
       return pollViewerResult<{ success: boolean; path?: string; error?: string }>(
-        { type: 'extract_pages', Range: range, outputPath: savePath },
+        { type: 'extract_pages', Range: normalizeRangeList(range), outputPath: savePath },
         'extract_pages',
         30_000,
         (d) => {
@@ -2502,7 +2516,7 @@ async function main(): Promise<void> {
       const nc = normalizeColors({ font_color });
       if (!nc.ok) return nok(nc.error);
       return pollViewerResult<{ success: boolean; error?: string }>(
-        { type: 'insert_page_number', fontFamily: font_family ?? 'Arial', fontSize: font_size ?? 12, fontColor: nc.colors.font_color ?? '#000000', format: format ?? '%1%', position: positionValue, range: range ?? null, startNumber: start_number ?? 1 },
+        { type: 'insert_page_number', fontFamily: font_family ?? 'Arial', fontSize: font_size ?? 12, fontColor: nc.colors.font_color ?? '#000000', format: format ?? '%1%', position: positionValue, range: normalizeRangeList(range), startNumber: start_number ?? 1 },
         'insert_page_number',
         15_000,
         (d) => {
