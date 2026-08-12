@@ -542,7 +542,7 @@ const MUTATING_COMMAND_TYPES = new Set([
   (app as any).callServerTool = async (params: { name: string; arguments: Record<string, unknown> }) => {
     if (params.name === 'report_viewer_result') {
       try {
-        const doc = (_currentDocumentView as any)?.getDocument?.();
+        const doc = (activeDocumentView() as any)?.getDocument?.();
         const pages = doc?.getPages?.() as unknown[] | undefined;
         let parsed: any = null;
         if (typeof params.arguments.json === 'string') {
@@ -551,7 +551,7 @@ const MUTATING_COMMAND_TYPES = new Set([
         if (parsed) {
           if (pages) {
             parsed._pageCount = pages.length;
-            const idx = (_currentDocumentView as any)?.getCurrentPageIndex?.();
+            const idx = (activeDocumentView() as any)?.getCurrentPageIndex?.();
             if (typeof idx === 'number') parsed._currentPage = idx + 1;
           }
           const reportType = params.arguments.type as string | undefined;
@@ -573,10 +573,32 @@ const ICON_SHRINK = `<svg viewBox="0 0 24 24"><polyline points="4 14 10 14 10 20
 const fullscreenBtn = document.getElementById('fullscreen-btn') as HTMLButtonElement;
 let _currentMode = 'inline';
 
-let _currentDocumentView: any = null;
 // Resolves when the current openPdf() call completes (including page-load wait).
 // Command poller awaits this before dispatching so stale document state is never read.
 let _openingDocument: Promise<void> | null = null;
+
+// RDB-7811/7842/7710: tool handlers used to read a module-level cache variable
+// holding "the active document", set once on open and refreshed defensively
+// before each command. Any gap in that refresh logic — a remount, a race, a
+// command path nobody thought to add a refresh to — let a handler run against
+// a stale document. The SDK itself already tracks which document is active
+// (getActiveDocumentViewElement()); there is no reason to keep our own copy
+// that can drift from it. Every handler calls this instead of reading a
+// cached variable, so there is nothing to go stale.
+function activeDocumentView(): any {
+  return _pdfWebService?.getActiveDocumentViewElement?.()?.documentView ?? null;
+}
+let _pdfWebService: any = null;
+
+function docInfo(vm: any): string {
+  try {
+    const doc = vm?.getDocument?.();
+    if (!doc) return 'none';
+    return `name="${doc.name}" pages=${doc.getNumPages?.() ?? '?'} id=${doc.id ?? '?'}`;
+  } catch (err) {
+    return `<error: ${(err as Error).message}>`;
+  }
+}
 // Resolved by the global documentOpened$ subscription when a new document finishes loading.
 let _resolveDocOpen: (() => void) | null = null;
 
@@ -1012,10 +1034,11 @@ function initEditor(initialFile?: File): Promise<ViewerResult> {
     const wrapperShadowRoot = (result as any).ui?.pdfWebElement?.shadowRoot as ShadowRoot | undefined;
     if (wrapperShadowRoot) ensureTopBarGap(wrapperShadowRoot);
     const svc = (result as any).ui?.pdfWebService;
+    _pdfWebService = svc;
     // documentOpened$ fires when a document is fully loaded — single authoritative subscription.
     // Handles all subsequent display_pdf calls; the first open is handled separately below.
     svc?.documentOpened$?.subscribe?.((docVm: any) => {
-      _currentDocumentView = docVm;
+      beacon(`[docstate] documentOpened$ fired: ${docInfo(docVm)}`);
       applyDefaultViewSettings(docVm);
       // Resolve the pending openPdf() Promise so commands are unblocked.
       if (_resolveDocOpen) { const r = _resolveDocOpen; _resolveDocOpen = null; r(); }
@@ -1023,7 +1046,7 @@ function initEditor(initialFile?: File): Promise<ViewerResult> {
       (app as any).callServerTool({ name: 'report_viewer_result', arguments: { type: 'doc_opened' } }).catch(() => {});
     });
     const initial = svc?.getActiveDocumentViewElement?.()?.documentView;
-    if (initial) { _currentDocumentView = initial; applyDefaultViewSettings(initial); }
+    if (initial) applyDefaultViewSettings(initial);
 
     statusEl.style.display = 'none';
     return result;
@@ -1074,27 +1097,50 @@ async function openPdf(token: string, name: string, filePath?: string): Promise<
   // Viewer already mounted (subsequent display_pdf call): open into it.
   show(`opening ${name}…`);
   const editor = await editorReady;
-  // Use the canonical openDocument() API and read the active document directly after it
-  // resolves — more reliable than waiting for documentOpened$ which may not fire for every case.
   const svc = (editor as any).ui?.pdfWebService;
+  _pdfWebService = svc;
+
+  // RDB-7811: openDocument()/openFile() previously raced against a fixed
+  // timeout and, on timeout, fell through silently to whatever document was
+  // already active — still the PREVIOUS file if the open was merely slow,
+  // not actually failed. A command (e.g. split_pdf) then ran against the
+  // wrong document. Wait for the SDK's own activeDocumentChanged$ event to
+  // confirm the viewer actually switched to the document we asked to open,
+  // instead of polling or trusting a stale reference; the timeout below is
+  // only an outer abort bound, not a "proceed anyway" fallback.
+  let changeSub: { unsubscribe: () => void } | undefined;
+  const activeMatch = new Promise<any>((resolve) => {
+    const current = svc?.getActiveDocumentViewElement?.()?.documentView;
+    if ((current as any)?.getDocument?.()?.name === name) { resolve(current); return; }
+    changeSub = svc?.activeDocumentChanged$?.subscribe?.((docVm: any) => {
+      if (docVm?.getDocument?.()?.name === name) resolve(docVm);
+    });
+  });
+
   try {
     if (svc?.openDocument) {
-      await Promise.race([
-        svc.openDocument(file),
-        new Promise<void>((_, rej) => setTimeout(() => rej(new Error('open timeout')), 10_000)),
-      ]);
+      await svc.openDocument(file);
     } else {
-      await Promise.race([
-        editor.ui?.pdfWebElement?.documentView?.openFile(file) ?? Promise.resolve(),
-        new Promise<void>((_, rej) => setTimeout(() => rej(new Error('open timeout')), 10_000)),
-      ]);
+      await (editor.ui?.pdfWebElement?.documentView?.openFile(file) ?? Promise.resolve());
     }
-  } catch { /* timeout or open error — proceed with whatever document is active */ }
-  // After openDocument resolves, read the active document directly.
-  const activeVm = svc?.getActiveDocumentViewElement?.()?.documentView;
-  if (activeVm) { _currentDocumentView = activeVm; applyDefaultViewSettings(activeVm); }
-  // Unblock the server-side command gate.
+  } catch { /* open error — the activeMatch wait below is the real gate */ }
+
+  const activeVm = await Promise.race([
+    activeMatch,
+    new Promise<null>((resolve) => setTimeout(() => resolve(null), 10_000)),
+  ]);
+  changeSub?.unsubscribe?.();
+
+  // Unblock the server-side command gate regardless of outcome — a failure here
+  // must not leave later tool calls sitting through the doc-open grace window.
   (app as any).callServerTool({ name: 'report_viewer_result', arguments: { type: 'doc_opened' } }).catch(() => {});
+  if (!activeVm) {
+    const stillActive = (svc?.getActiveDocumentViewElement?.()?.documentView as any)?.getDocument?.()?.name;
+    beacon(`[docstate] openPdf FAILED to switch: requested="${name}" stillActive="${stillActive ?? 'no document'}"`);
+    throw new Error(`Viewer did not switch to "${name}" (currently showing "${stillActive ?? 'no document'}") — refusing to run the command against the wrong file.`);
+  }
+  beacon(`[docstate] openPdf confirmed: requested="${name}" -> ${docInfo(activeVm)}`);
+  applyDefaultViewSettings(activeVm);
   statusEl.style.display = 'none';
 }
 
@@ -1143,7 +1189,7 @@ async function autoSaveWorkingCopy(): Promise<string | null> {
   const targetPath = getWorkingFilePath();
   if (!targetPath) return null;
   try {
-    const doc = (_currentDocumentView as any)?.getDocument?.();
+    const doc = (activeDocumentView() as any)?.getDocument?.();
     if (!doc) return null;
     const raw = await doc.exportDocument({ as: 'uint8array' });
     const bytes = new Uint8Array(raw instanceof ArrayBuffer ? raw : (raw as ArrayBufferView).buffer);
@@ -1199,28 +1245,26 @@ function startViewerCommandPoller(): void {
   // RDB-7842: setInterval fires on a fixed clock regardless of whether the
   // previous tick's async callback has finished — a slow command (SDK call,
   // or the RDB-7843 auto-save export+upload after every edit) left multiple
-  // ticks running concurrently against the same _currentDocumentView, racing
-  // each other. That's a very plausible source of "PDF stops responding
-  // after several operations" and the resulting server-side poll timeout.
-  // A single in-flight guard serializes ticks so only one command is ever
-  // processed at a time.
+  // ticks running concurrently against the active document, racing each
+  // other. That's a very plausible source of "PDF stops responding after
+  // several operations" and the resulting server-side poll timeout. A single
+  // in-flight guard serializes ticks so only one command is ever processed
+  // at a time.
   let processing = false;
   setInterval(async () => {
     if (!editorReady || processing) return;
     processing = true;
     try {
-      const result = await (app as any).callServerTool({ name: 'get_viewer_command', arguments: {} });
+      // RDB-7811: pass this widget's own token so the server can tell a stale,
+      // still-mounted widget (an earlier chat turn's render) apart from the
+      // one covering the model's most recent open — see get_viewer_command.
+      const result = await (app as any).callServerTool({ name: 'get_viewer_command', arguments: { token: _currentToken } });
       const { command } = JSON.parse((result.content[0] as { text: string }).text) as { command: Record<string, unknown> | null };
       if (!command) return;
       // Wait for any in-progress document open to complete before executing viewer commands.
       if (_openingDocument) try { await _openingDocument; } catch { /* ignore */ }
-      // Always refresh _currentDocumentView from the live service before each command so that
-      // stale references from a previous document never leak into tool handlers.
-      {
-        const ed = await editorReady;
-        const freshVm = (ed as any).ui?.pdfWebService?.getActiveDocumentViewElement?.()?.documentView;
-        if (freshVm) _currentDocumentView = freshVm;
-      }
+      await editorReady;
+      beacon(`[docstate] dispatching command="${command.type}" activeDoc=${docInfo(activeDocumentView())}`);
       if (command.type === 'rotate_pages') {
         await handleRotatePages({ angle: command.angle as number, pages: command.pages as number[] | null });
       } else if (command.type === 'add_annotation') {
@@ -1394,7 +1438,7 @@ function startViewerCommandPoller(): void {
           padding: command.padding as number | null,
         });
       } else if (command.type === 'reset_selection') {
-        (_currentDocumentView as any)?.resetSelection?.();
+        (activeDocumentView() as any)?.resetSelection?.();
         await (app as any).callServerTool({
           name: 'report_viewer_result',
           arguments: { type: 'reset_selection', json: JSON.stringify({ success: true }) },
@@ -1434,7 +1478,7 @@ async function reportFailure(type: string, err: unknown): Promise<void> {
 async function handleRotatePages(data: { angle: number; pages: number[] | null }): Promise<void> {
   try {
     show('Rotating pages…');
-    const doc = (_currentDocumentView as any)?.getDocument?.();
+    const doc = (activeDocumentView() as any)?.getDocument?.();
     if (!doc) throw new Error('document not available in viewer');
     const totalPages = (doc.getPages() as unknown[]).length;
     const range: number[] = data.pages
@@ -1461,7 +1505,7 @@ async function handleRotatePages(data: { angle: number; pages: number[] | null }
 async function handleInsertBlankPage(data: { afterPage: number | null }): Promise<void> {
   try {
     show('Inserting blank page…');
-    const doc = (_currentDocumentView as any)?.getDocument?.();
+    const doc = (activeDocumentView() as any)?.getDocument?.();
     if (!doc) throw new Error('document not available in viewer');
     const pages = doc.getPages() as Array<{ width?: number; height?: number }>;
     const totalPages = pages.length;
@@ -1509,7 +1553,7 @@ async function handleAddImageToPage(data: {
 }): Promise<void> {
   try {
     show('Loading image…');
-    const doc = (_currentDocumentView as any)?.getDocument?.();
+    const doc = (activeDocumentView() as any)?.getDocument?.();
     if (!doc) throw new Error('document not available in viewer');
 
     const pages = doc.getPages() as Array<{ width?: number; height?: number }>;
@@ -1607,7 +1651,7 @@ type AnnotationCommand = {
 async function handleAddAnnotation(data: AnnotationCommand): Promise<void> {
   try {
     show('Adding annotation…');
-    const doc = (_currentDocumentView as any)?.getDocument?.();
+    const doc = (activeDocumentView() as any)?.getDocument?.();
     if (!doc) throw new Error('document not available in viewer');
     const pages = (doc.getPages() as unknown[]);
     const pageIndex = data.page - 1;
@@ -1670,7 +1714,7 @@ async function handleCircleText(data: {
 }): Promise<void> {
   try {
     show(`Circling "${data.text}"…`);
-    const documentView = _currentDocumentView;
+    const documentView = activeDocumentView();
     if (!documentView) throw new Error('document view not available');
     const doc = (documentView as any).getDocument?.();
     if (!doc) throw new Error('document not available');
@@ -1783,7 +1827,7 @@ function buildSearchHighlight(): { drawHighlight: (target: any, pageIndex: numbe
 async function handleSearchText(data: { query: string; caseSensitive: boolean; wholeWord: boolean }): Promise<void> {
   try {
     show(`Searching for "${data.query}"…`);
-    const documentView = _currentDocumentView;
+    const documentView = activeDocumentView();
     if (!documentView) throw new Error('document view not available');
 
     // Mirror toolbar: stop previous search, clear selection and highlight
@@ -1868,7 +1912,6 @@ async function handleCloseDocument(): Promise<void> {
     const editor = await editorReady!;
     const docViewEl = (editor as any).ui?.pdfWebService?.getActiveDocumentViewElement?.();
     await docViewEl?.closeDocument?.();
-    _currentDocumentView = null;
     _currentToken = '';
     _currentFilePath = '';
     _workingFilePath = null;
@@ -1886,7 +1929,7 @@ async function handleCloseDocument(): Promise<void> {
 
 async function handleGetViewState(): Promise<void> {
   try {
-    const documentView = _currentDocumentView;
+    const documentView = activeDocumentView();
     const doc = (documentView as any)?.getDocument?.();
     const currentPage = ((documentView as any)?.getFocusPage?.() ?? 0) + 1;
     const pageCount = (doc as any)?.getNumPages?.() ?? 0;
@@ -1903,7 +1946,7 @@ async function handleGetViewState(): Promise<void> {
 
 async function handleSetViewState(data: { page: number }): Promise<void> {
   try {
-    (_currentDocumentView as any)?.goToPage?.(data.page - 1);
+    (activeDocumentView() as any)?.goToPage?.(data.page - 1);
     show(`Page ${data.page}`);
     setTimeout(() => { statusEl.style.display = 'none'; }, 1500);
   } catch (err) {
@@ -1913,9 +1956,18 @@ async function handleSetViewState(data: { page: number }): Promise<void> {
 
 async function handleReadDocumentInfo(): Promise<void> {
   try {
-    const doc = (_currentDocumentView as any)?.getDocument?.();
+    const doc = (activeDocumentView() as any)?.getDocument?.();
     if (!doc) throw new Error('document not available');
+    beacon(`[docstate] read_document_info reading: ${docInfo(activeDocumentView())}`);
     const info: Record<string, unknown> = {
+      // RDB-7811: this tool has no path argument — it always reports on
+      // whichever document is currently active, which is wrong the moment
+      // the model calls it to check a file it's about to open (e.g. to plan
+      // split ranges) rather than one it already opened. Surfacing the
+      // actual open file's name/path lets that mismatch be caught instead of
+      // silently used as if it were the file just named in the conversation.
+      fileName: doc.name ?? '',
+      filePath: doc.filePath ?? _currentFilePath ?? '',
       pageCount: doc.getNumPages?.() ?? 0,
       title: doc.title ?? '',
       author: doc.author ?? '',
@@ -1949,7 +2001,7 @@ async function handleReadDocumentInfo(): Promise<void> {
 
 async function handleReadAnnotations(data: { page: number | null }): Promise<void> {
   try {
-    const doc = (_currentDocumentView as any)?.getDocument?.();
+    const doc = (activeDocumentView() as any)?.getDocument?.();
     if (!doc) throw new Error('document not available');
     const docId = (doc as any).id;
     const pdfEditor = (doc as any).pdfEditor;
@@ -1989,7 +2041,7 @@ async function handleReadAnnotations(data: { page: number | null }): Promise<voi
 async function handleGetPageImage(data: { page: number; zoom: number }): Promise<void> {
   try {
     const pageIndex = data.page - 1;
-    const doc = (_currentDocumentView as any)?.getDocument?.();
+    const doc = (activeDocumentView() as any)?.getDocument?.();
     if (!doc) throw new Error('document not available');
     const result = await (doc as any).getPagePreview({ pageIndex, dpr: 1, zoom: data.zoom });
     const bytes: Uint8Array = result.body;
@@ -2015,7 +2067,7 @@ async function handleGetPageImage(data: { page: number; zoom: number }): Promise
 
 async function handleReadText(): Promise<void> {
   try {
-    const doc = (_currentDocumentView as any)?.getDocument?.();
+    const doc = (activeDocumentView() as any)?.getDocument?.();
     if (!doc) throw new Error('document not available');
     const file: File = await (doc as any).convertToText();
     const text = await file.text();
@@ -2035,7 +2087,7 @@ async function handleReadText(): Promise<void> {
 
 async function handleUpdateAnnotation(data: { page: number; annotIndex: number; color: string | null; fillColor: string | null; opacity: number | null; text: string | null }): Promise<void> {
   try {
-    const doc = (_currentDocumentView as any)?.getDocument?.();
+    const doc = (activeDocumentView() as any)?.getDocument?.();
     if (!doc) throw new Error('document not available');
     const pageIndex = data.page - 1;
     const docId = (doc as any).id;
@@ -2066,7 +2118,7 @@ async function handleUpdateAnnotation(data: { page: number; annotIndex: number; 
 
 async function handleDeleteAnnotation(data: { page: number; annotIndex: number }): Promise<void> {
   try {
-    const doc = (_currentDocumentView as any)?.getDocument?.();
+    const doc = (activeDocumentView() as any)?.getDocument?.();
     if (!doc) throw new Error('document not available');
     const pageIndex = data.page - 1;
     await (doc as any).deleteAnnotations({ pageIndex, annotIds: [data.annotIndex] });
@@ -2089,7 +2141,7 @@ async function handleDeleteAnnotation(data: { page: number; annotIndex: number }
 
 async function handleReadPageInfo(data: { page: number }): Promise<void> {
   try {
-    const doc = (_currentDocumentView as any)?.getDocument?.();
+    const doc = (activeDocumentView() as any)?.getDocument?.();
     if (!doc) throw new Error('document not available');
     const pageIndex = data.page - 1;
     const page = doc.getPage?.(pageIndex);
@@ -2112,7 +2164,7 @@ async function handleReadPageInfo(data: { page: number }): Promise<void> {
 
 async function handleReplaceText(data: { searchText: string; replaceWith: string; page: number | null; replaceAll: boolean; caseSensitive: boolean }): Promise<void> {
   try {
-    const doc = (_currentDocumentView as any)?.getDocument?.();
+    const doc = (activeDocumentView() as any)?.getDocument?.();
     if (!doc) throw new Error('document not available');
 
     const totalPages = (doc.getNumPages?.() ?? 0) as number;
@@ -2197,7 +2249,7 @@ function ownerPasswordRequired(doc: any): boolean {
 
 async function handleReadBookmarks(): Promise<void> {
   try {
-    const doc = (_currentDocumentView as any)?.getDocument?.();
+    const doc = (activeDocumentView() as any)?.getDocument?.();
     if (!doc) throw new Error('document not available');
     if (ownerPasswordRequired(doc)) {
       throw new Error('This document has an owner password set. Its bookmarks cannot be read until it is unlocked with that password.');
@@ -2233,7 +2285,7 @@ async function handleReadBookmarks(): Promise<void> {
 
 async function handleAddBookmark(data: { page: number; title: string | null; parentPath: number[] }): Promise<void> {
   try {
-    const doc = (_currentDocumentView as any)?.getDocument?.();
+    const doc = (activeDocumentView() as any)?.getDocument?.();
     if (!doc) throw new Error('document not available');
     await doc.addBookmark({ pageIndex: data.page - 1, title: data.title ?? `Page ${data.page}`, parentIndex: data.parentPath });
     await (app as any).callServerTool({
@@ -2253,7 +2305,7 @@ async function handleAddBookmark(data: { page: number; title: string | null; par
 
 async function handleDeleteBookmark(data: { path: number[] }): Promise<void> {
   try {
-    const doc = (_currentDocumentView as any)?.getDocument?.();
+    const doc = (activeDocumentView() as any)?.getDocument?.();
     if (!doc) throw new Error('document not available');
     await doc.deleteBookmark({ path: data.path });
     await (app as any).callServerTool({
@@ -2273,7 +2325,7 @@ async function handleDeleteBookmark(data: { path: number[] }): Promise<void> {
 
 async function handleDeleteAllBookmarks(): Promise<void> {
   try {
-    const doc = (_currentDocumentView as any)?.getDocument?.();
+    const doc = (activeDocumentView() as any)?.getDocument?.();
     if (!doc) throw new Error('document not available');
     await doc.deleteAllBookmarks();
     await (app as any).callServerTool({
@@ -2365,7 +2417,7 @@ function buildZip(files: { name: string; data: Uint8Array }[]): Uint8Array {
 async function handleExtractImages(data: { outputPath: string; pages: number[] | null; format: string }): Promise<void> {
   try {
     showSaveProgress('Extracting images');
-    const doc = (_currentDocumentView as any)?.getDocument?.();
+    const doc = (activeDocumentView() as any)?.getDocument?.();
     if (!doc) throw new Error('document not available');
 
     const totalPages = (doc.getNumPages?.() ?? 0) as number;
@@ -2424,7 +2476,7 @@ async function handleExtractImages(data: { outputPath: string; pages: number[] |
 async function handleExportComments(data: { outputPath: string }): Promise<void> {
   try {
     showSaveProgress('Exporting comments');
-    const doc = (_currentDocumentView as any)?.getDocument?.();
+    const doc = (activeDocumentView() as any)?.getDocument?.();
     if (!doc) throw new Error('document not available');
 
     const raw = await (doc as any).exportComments();
@@ -2463,7 +2515,7 @@ async function handleExportComments(data: { outputPath: string }): Promise<void>
 
 async function handleResizePages(data: { width: number; height: number; pages: number[] | null }): Promise<void> {
   try {
-    const doc = (_currentDocumentView as any)?.getDocument?.();
+    const doc = (activeDocumentView() as any)?.getDocument?.();
     if (!doc) throw new Error('document not available');
     const totalPages = (doc.getNumPages?.() ?? 0) as number;
     const range1based: number[] = data.pages
@@ -2492,7 +2544,7 @@ async function handleResizePages(data: { width: number; height: number; pages: n
 async function handleDeletePages(data: { pages: number[] }): Promise<void> {
   try {
     show('Deleting pages…');
-    const doc = (_currentDocumentView as any)?.getDocument?.();
+    const doc = (activeDocumentView() as any)?.getDocument?.();
     if (!doc) throw new Error('document not available');
     const totalPages = (doc.getNumPages?.() ?? 0) as number;
     // deletePages converts 1-based → 0-based internally (.map(e => +e - 1))
@@ -2519,7 +2571,7 @@ async function handleDeletePages(data: { pages: number[] }): Promise<void> {
 async function handleMovePages(data: { pages: number[]; afterPage: number }): Promise<void> {
   try {
     show('Moving pages…');
-    const doc = (_currentDocumentView as any)?.getDocument?.();
+    const doc = (activeDocumentView() as any)?.getDocument?.();
     if (!doc) throw new Error('document not available');
     const totalPages = (doc.getNumPages?.() ?? 0) as number;
     const rangeStrings = data.pages.filter((p) => p >= 1 && p <= totalPages).map(String);
@@ -2545,7 +2597,7 @@ async function handleMovePages(data: { pages: number[]; afterPage: number }): Pr
 async function handleDuplicatePages(data: { pages: number[]; afterPage: number | null }): Promise<void> {
   try {
     show('Duplicating pages…');
-    const doc = (_currentDocumentView as any)?.getDocument?.();
+    const doc = (activeDocumentView() as any)?.getDocument?.();
     if (!doc) throw new Error('document not available');
     const totalPages = (doc.getNumPages?.() ?? 0) as number;
     const sourceRange = data.pages.filter((p) => p >= 1 && p <= totalPages).map(String);
@@ -2572,7 +2624,7 @@ async function handleDuplicatePages(data: { pages: number[]; afterPage: number |
 async function handleReversePages(data: { pages: number[] | null }): Promise<void> {
   try {
     show('Reversing pages…');
-    const doc = (_currentDocumentView as any)?.getDocument?.();
+    const doc = (activeDocumentView() as any)?.getDocument?.();
     if (!doc) throw new Error('document not available');
     const totalPages = (doc.getNumPages?.() ?? 0) as number;
     const params: Record<string, unknown> = {};
@@ -2599,7 +2651,7 @@ async function handleReversePages(data: { pages: number[] | null }): Promise<voi
 
 async function handleUndo(): Promise<void> {
   try {
-    const doc = (_currentDocumentView as any)?.getDocument?.();
+    const doc = (activeDocumentView() as any)?.getDocument?.();
     if (!doc) throw new Error('document not available');
     await doc.undo();
     show('Undo');
@@ -2621,7 +2673,7 @@ async function handleUndo(): Promise<void> {
 
 async function handleRedo(): Promise<void> {
   try {
-    const doc = (_currentDocumentView as any)?.getDocument?.();
+    const doc = (activeDocumentView() as any)?.getDocument?.();
     if (!doc) throw new Error('document not available');
     await doc.redo();
     show('Redo');
@@ -2643,7 +2695,7 @@ async function handleRedo(): Promise<void> {
 
 async function handleUpdateDocumentProperties(data: { title: string | null; author: string | null; subject: string | null; keywords: string | null }): Promise<void> {
   try {
-    const doc = (_currentDocumentView as any)?.getDocument?.();
+    const doc = (activeDocumentView() as any)?.getDocument?.();
     if (!doc) throw new Error('document not available');
     const properties: Record<string, string> = {};
     if (data.title !== null) properties['T'] = data.title;
@@ -2688,7 +2740,7 @@ function normalizeChoiceItem(it: any): { name: string; value: string } {
 
 async function handleReadFormFields(): Promise<void> {
   try {
-    const doc = (_currentDocumentView as any)?.getDocument?.();
+    const doc = (activeDocumentView() as any)?.getDocument?.();
     if (!doc) throw new Error('document not available');
     const raw: any[] = doc.acroforms ?? [];
     // Read the real on-state values of button fields once so checkboxes and, in
@@ -2843,7 +2895,7 @@ function resolveChoiceOption(field: any, input: string): { name: string; value: 
 
 async function handleUpdateFormField(data: { field_name: string; value: string }): Promise<void> {
   try {
-    const doc = (_currentDocumentView as any)?.getDocument?.();
+    const doc = (activeDocumentView() as any)?.getDocument?.();
     if (!doc) throw new Error('document not available');
 
     const fields: any[] = doc.acroforms ?? [];
@@ -2947,7 +2999,7 @@ async function handleUpdateFormField(data: { field_name: string; value: string }
     // Keep the in-memory field value in sync so read_form_fields reflects the
     // change, and refresh the viewer so the update is visible immediately.
     try { field.value = appliedValue; } catch (_) {}
-    (_currentDocumentView as any)?.invalidate?.();
+    (activeDocumentView() as any)?.invalidate?.();
 
     show('Form field updated');
     setTimeout(() => { statusEl.style.display = 'none'; }, 2000);
@@ -2968,7 +3020,7 @@ async function handleUpdateFormField(data: { field_name: string; value: string }
 
 async function handleApplyRedactions(): Promise<void> {
   try {
-    const doc = (_currentDocumentView as any)?.getDocument?.();
+    const doc = (activeDocumentView() as any)?.getDocument?.();
     if (!doc) throw new Error('document not available');
     await (doc as any).applyRedactions();
     show('Redactions applied permanently');
@@ -2990,7 +3042,7 @@ async function handleApplyRedactions(): Promise<void> {
 
 async function handleDeleteBatesNumbering(): Promise<void> {
   try {
-    const doc = (_currentDocumentView as any)?.getDocument?.();
+    const doc = (activeDocumentView() as any)?.getDocument?.();
     if (!doc) throw new Error('document not available');
     await (doc as any).deleteBatesNumbering();
     show('Bates numbering removed');
@@ -3012,7 +3064,7 @@ async function handleDeleteBatesNumbering(): Promise<void> {
 
 async function handleDeleteWatermark(data: { range: string[] | null }): Promise<void> {
   try {
-    const doc = (_currentDocumentView as any)?.getDocument?.();
+    const doc = (activeDocumentView() as any)?.getDocument?.();
     if (!doc) throw new Error('document not available');
     // null range = whole document (the server normalizes ["all"] to null,
     // RDB-7893) — expand to an explicit 1-N, the only form the engine parses.
@@ -3037,7 +3089,7 @@ async function handleDeleteWatermark(data: { range: string[] | null }): Promise<
 
 async function handleDeleteHeader(data: { range: string[] | null }): Promise<void> {
   try {
-    const doc = (_currentDocumentView as any)?.getDocument?.();
+    const doc = (activeDocumentView() as any)?.getDocument?.();
     if (!doc) throw new Error('document not available');
     // See handleDeleteWatermark: null = whole document, expand to 1-N.
     const range = data.range && data.range.length > 0 ? data.range : [`1-${(doc as any).getNumPages?.() ?? 1}`];
@@ -3061,7 +3113,7 @@ async function handleDeleteHeader(data: { range: string[] | null }): Promise<voi
 
 async function handleDeletePageNumber(data: { range: string[] | null; pages: number[] | null }): Promise<void> {
   try {
-    const doc = (_currentDocumentView as any)?.getDocument?.();
+    const doc = (activeDocumentView() as any)?.getDocument?.();
     if (!doc) throw new Error('document not available');
     const pageCount: number = (doc as any).getNumPages?.() ?? 1;
     const params: Record<string, unknown> = {};
@@ -3091,7 +3143,7 @@ async function handleDeletePageNumber(data: { range: string[] | null; pages: num
 async function handleInsertPageNumber(data: { fontFamily: string; fontSize: number; fontColor: string; format: string; position: number; range: string[] | null; startNumber: number }): Promise<void> {
   try {
     show('Inserting page numbers…');
-    const doc = (_currentDocumentView as any)?.getDocument?.();
+    const doc = (activeDocumentView() as any)?.getDocument?.();
     if (!doc) throw new Error('document not available');
     const params: Record<string, unknown> = {
       font: { family: data.fontFamily, size: data.fontSize, color: data.fontColor },
@@ -3120,7 +3172,7 @@ async function handleInsertPageNumber(data: { fontFamily: string; fontSize: numb
 
 async function handleDeleteTextBlocks(data: { pageIndex: number; blockIndices: number[] }): Promise<void> {
   try {
-    const doc = (_currentDocumentView as any)?.getDocument?.();
+    const doc = (activeDocumentView() as any)?.getDocument?.();
     if (!doc) throw new Error('document not available');
     await (doc as any).deleteTextBlocks({ pageIndex: data.pageIndex, blockIndices: data.blockIndices });
     show(`Deleted ${data.blockIndices.length} text block(s)`);
@@ -3143,7 +3195,7 @@ async function handleDeleteTextBlocks(data: { pageIndex: number; blockIndices: n
 async function handleConvertToImages(data: { dpi: number | null; outputPath: string }): Promise<void> {
   try {
     showSaveProgress('Converting pages to images');
-    const doc = (_currentDocumentView as any)?.getDocument?.();
+    const doc = (activeDocumentView() as any)?.getDocument?.();
     if (!doc) throw new Error('document not available');
     const zipFile: File = await (doc as any).convertToImages(data.dpi ?? undefined);
     const bytes = new Uint8Array(await zipFile.arrayBuffer());
@@ -3167,7 +3219,7 @@ async function handleConvertToImages(data: { dpi: number | null; outputPath: str
 async function handleExtractPages(data: { Range: string[] | null; outputPath: string }): Promise<void> {
   try {
     showSaveProgress('Extracting pages');
-    const doc = (_currentDocumentView as any)?.getDocument?.();
+    const doc = (activeDocumentView() as any)?.getDocument?.();
     if (!doc) throw new Error('document not available');
     // See handleDeleteWatermark: null = whole document, expand to 1-N.
     const Range = data.Range && data.Range.length > 0 ? data.Range : [`1-${(doc as any).getNumPages?.() ?? 1}`];
@@ -3193,7 +3245,7 @@ async function handleExtractPages(data: { Range: string[] | null; outputPath: st
 async function handleSaveAs(data: { outputPath: string | null; fileName: string | null }): Promise<void> {
   try {
     showSaveProgress('Saving copy');
-    const doc = (_currentDocumentView as any)?.getDocument?.();
+    const doc = (activeDocumentView() as any)?.getDocument?.();
     if (!doc) throw new Error('document not available');
     const raw = await (doc as any).exportDocument({ as: 'uint8array' });
     const bytes = new Uint8Array(raw instanceof ArrayBuffer ? raw : (raw as ArrayBufferView).buffer);
@@ -3225,7 +3277,7 @@ async function handleSaveAs(data: { outputPath: string | null; fileName: string 
 async function handleSetSecurityPermissions(data: { userPassword: string; ownerPassword: string; cryptMethod: number; permFlags: number }): Promise<void> {
   try {
     show('Setting security permissions…');
-    const doc = (_currentDocumentView as any)?.getDocument?.();
+    const doc = (activeDocumentView() as any)?.getDocument?.();
     if (!doc) throw new Error('document not available');
     await (doc as any).setSecurityPermissions({
       userPassword: data.userPassword || undefined,
@@ -3253,7 +3305,7 @@ async function handleSetSecurityPermissions(data: { userPassword: string; ownerP
 async function handleSearchAndRedact(data: { text: string; caseSensitive: boolean; wholeWord: boolean }): Promise<void> {
   try {
     show(`Searching for "${data.text}"…`);
-    const doc = (_currentDocumentView as any)?.getDocument?.();
+    const doc = (activeDocumentView() as any)?.getDocument?.();
     if (!doc) throw new Error('document not available');
 
     // PageTextSearchFlags: 1 = IgnoreCase, 2 = WholeWord
@@ -3262,12 +3314,12 @@ async function handleSearchAndRedact(data: { text: string; caseSensitive: boolea
     if (data.wholeWord) flags |= 2;
 
     const allRanges: any[] = [];
-    const sub = (_currentDocumentView as any).onSearchResults?.()?.subscribe?.((ranges: any[]) => {
+    const sub = (activeDocumentView() as any).onSearchResults?.()?.subscribe?.((ranges: any[]) => {
       if (ranges?.length) allRanges.push(...ranges);
     });
-    await (_currentDocumentView as any).search?.(data.text, flags);
+    await (activeDocumentView() as any).search?.(data.text, flags);
     sub?.unsubscribe?.();
-    (_currentDocumentView as any).stopSearch?.();
+    (activeDocumentView() as any).stopSearch?.();
 
     if (!allRanges.length) {
       show(`No occurrences of "${data.text}" found`);
@@ -3358,7 +3410,7 @@ function toArgbColor(hex: string): string {
 
 async function handleReadPageTextBlocks(data: { page: number }): Promise<void> {
   try {
-    const doc = (_currentDocumentView as any)?.getDocument?.();
+    const doc = (activeDocumentView() as any)?.getDocument?.();
     if (!doc) throw new Error('document not available');
     const pageIndex = data.page - 1;
     const pages: any[] = doc.getPages?.() ?? [];
@@ -3400,7 +3452,7 @@ async function handleFormatText(data: {
   highlight_color?: string;
 }): Promise<void> {
   try {
-    const doc = (_currentDocumentView as any)?.getDocument?.();
+    const doc = (activeDocumentView() as any)?.getDocument?.();
     if (!doc) throw new Error('document not available');
     const pageIndex = data.page - 1;
     const pages: any[] = doc.getPages?.() ?? [];
@@ -3479,7 +3531,7 @@ async function handleAddTextToPage(data: {
 }): Promise<void> {
   try {
     show('Adding text…');
-    const doc = (_currentDocumentView as any)?.getDocument?.();
+    const doc = (activeDocumentView() as any)?.getDocument?.();
     if (!doc) throw new Error('document not available in viewer');
     const pages = (doc.getPages() as unknown[]);
     const pageIndex = data.page - 1;
@@ -3533,7 +3585,7 @@ type AddFormFieldCommand = {
 async function handleAddFormField(data: AddFormFieldCommand): Promise<void> {
   try {
     show('Adding form field…');
-    const doc = (_currentDocumentView as any)?.getDocument?.();
+    const doc = (activeDocumentView() as any)?.getDocument?.();
     if (!doc) throw new Error('document not available in viewer');
     const pages = (doc.getPages() as unknown[]);
     const pageIndex = data.page - 1;
@@ -3629,7 +3681,7 @@ async function handleSplit(cmd: ToolCommand): Promise<void> {
   const { ranges, pagesPerFile, outputDir = '', baseName = 'split' } = cmd;
   try {
     showSaveProgress('Splitting PDF');
-    const doc = (_currentDocumentView as any)?.getDocument?.();
+    const doc = (activeDocumentView() as any)?.getDocument?.();
     if (!doc) throw new Error('document not available in viewer');
     const totalPages = ((doc as any).getPages() as unknown[]).length;
     const sep = outputDir.includes('\\') ? '\\' : '/';
@@ -3647,7 +3699,7 @@ async function handleSplit(cmd: ToolCommand): Promise<void> {
       }
     }
 
-    const saved: string[] = [];
+    const saved: Array<{ path: string; pages: number }> = [];
     for (let i = 0; i < groups.length; i++) {
       const pages = groups[i];
       if (!pages.length) continue;
@@ -3656,18 +3708,33 @@ async function handleSplit(cmd: ToolCommand): Promise<void> {
       const label = pages.length === 1 ? `p${pages[0]}` : `p${pages[0]}-${pages[pages.length - 1]}`;
       const outPath = outputDir ? `${outputDir}${sep}${baseName}_${label}.pdf` : `${baseName}_${label}.pdf`;
       await saveChunked(extracted, outPath, `Saving part ${i + 1} of ${groups.length}`);
-      saved.push(outPath);
+      saved.push({ path: outPath, pages: pages.length });
     }
     showSaveSuccess(`Split into ${saved.length} file${saved.length !== 1 ? 's' : ''}`, outputDir || undefined);
+    // RDB-7811: split_pdf's own tool response returns immediately (it has to,
+    // to deliver the open target to this widget in the first place) — this is
+    // the only place the REAL outcome (actual source page count, actual files
+    // produced) is known. Report it so get_last_operation_result can hand the
+    // model ground truth instead of it guessing or reusing a stale answer
+    // from an earlier, unrelated read_document_information call.
+    await (app as any).callServerTool({
+      name: 'report_viewer_result',
+      arguments: { type: 'split_done', json: JSON.stringify({ success: true, sourcePages: totalPages, files: saved }) },
+    }).catch(() => {});
   } catch (err) {
-    showSaveError(`Split failed: ${err instanceof Error ? err.message : String(err)}`);
+    const message = err instanceof Error ? err.message : String(err);
+    showSaveError(`Split failed: ${message}`);
+    await (app as any).callServerTool({
+      name: 'report_viewer_result',
+      arguments: { type: 'split_done', json: JSON.stringify({ success: false, error: message }) },
+    }).catch(() => {});
   }
 }
 
 async function handleMerge(files: Array<{ token: string; name: string }>, outputPath: string): Promise<void> {
   try {
     showSaveProgress(`Merging ${files.length} PDFs`);
-    const doc = (_currentDocumentView as any)?.getDocument?.();
+    const doc = (activeDocumentView() as any)?.getDocument?.();
     if (!doc) throw new Error('document not available in viewer');
     for (let i = 1; i < files.length; i++) {
       showSaveProgress(`Merging — inserting file ${i + 1} of ${files.length} (${files[i].name})`);
@@ -3684,23 +3751,43 @@ async function handleMerge(files: Array<{ token: string; name: string }>, output
     _currentFilePath = outputPath;
     _workingFilePath = null; // merge produces a new original — start a fresh working copy from it
     showSaveSuccess('PDFs merged successfully', outputPath);
+    const totalPages = ((doc as any).getPages() as unknown[]).length;
+    await (app as any).callServerTool({
+      name: 'report_viewer_result',
+      arguments: { type: 'merge_done', json: JSON.stringify({ success: true, outputPath, totalPages, fileCount: files.length }) },
+    }).catch(() => {});
   } catch (err) {
-    showSaveError(`Merge failed: ${err instanceof Error ? err.message : String(err)}`);
+    const message = err instanceof Error ? err.message : String(err);
+    showSaveError(`Merge failed: ${message}`);
+    await (app as any).callServerTool({
+      name: 'report_viewer_result',
+      arguments: { type: 'merge_done', json: JSON.stringify({ success: false, error: message }) },
+    }).catch(() => {});
   }
 }
 
 async function handleCompress(compression: string, outputPath: string): Promise<void> {
   try {
     showSaveProgress(`Compressing (${compression})`);
-    const doc = (_currentDocumentView as any)?.getDocument?.();
+    const doc = (activeDocumentView() as any)?.getDocument?.();
     if (!doc) throw new Error('document not available in viewer');
     const qualityValue = COMPRESS_QUALITY[compression] ?? 0.5;
+    const originalSize = doc.size ?? 0;
     const compressed = new Uint8Array(await doc.compress(qualityValue));
     beacon(`compress done: ${compressed.length} bytes → ${outputPath}`);
     await saveChunked(compressed, outputPath, 'Saving compressed PDF');
     showSaveSuccess('PDF compressed successfully', outputPath);
+    await (app as any).callServerTool({
+      name: 'report_viewer_result',
+      arguments: { type: 'compress_done', json: JSON.stringify({ success: true, outputPath, originalSize, compressedSize: compressed.length }) },
+    }).catch(() => {});
   } catch (err) {
-    showSaveError(`Compress failed: ${err instanceof Error ? err.message : String(err)}`);
+    const message = err instanceof Error ? err.message : String(err);
+    showSaveError(`Compress failed: ${message}`);
+    await (app as any).callServerTool({
+      name: 'report_viewer_result',
+      arguments: { type: 'compress_done', json: JSON.stringify({ success: false, error: message }) },
+    }).catch(() => {});
   }
 }
 
@@ -3816,7 +3903,7 @@ function getTextSelectionCaret(dv: any): any {
 
 async function handleGetSelectionInfo(): Promise<void> {
   try {
-    const dv = _currentDocumentView as any;
+    const dv = activeDocumentView() as any;
     const caret = getTextSelectionCaret(dv);
     const text: string | null = caret?.getSelectedText?.() ?? null;
     const range = caret?.getSelectedRange?.();
@@ -3848,7 +3935,7 @@ async function handleFormatSelectedText(data: {
   strikeout_color?: string;
 }): Promise<void> {
   try {
-    const dv = _currentDocumentView as any;
+    const dv = activeDocumentView() as any;
     const caret = getTextSelectionCaret(dv);
     if (!caret) throw new Error('No text selected in viewer. Select text first, then call this tool.');
 

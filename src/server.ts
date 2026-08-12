@@ -329,7 +329,7 @@ const RELAY_ALLOWED_HOSTS = new Set(['api-developers.avanquest.com']);
 
 // Verbose request/iframe/proxy tracing is debugging scaffolding; off unless
 // PWV_DEBUG is set.
-const DEBUG = process.env.PWV_DEBUG === '1';
+const DEBUG = process.env.PWV_DEBUG === '1' || process.env.PWV_DEBUG === 'true';
 function debug(msg: string): void {
   if (DEBUG) console.error(msg);
 }
@@ -346,9 +346,15 @@ async function startAssetServer(): Promise<{ port: number; baseUrl: string }> {
 
   // The sandbox CSP blocks fetch()/XHR to this origin but allows script
   // imports, so iframe log beacons arrive as dynamic imports with the message
-  // in the query string. No-op unless PWV_DEBUG is set.
+  // in the query string. Gated behind PWV_DEBUG, EXCEPT [docstate] probes
+  // (RDB-7811 investigation): those are low-volume and print unconditionally
+  // so diagnosing the "wrong document" bug doesn't require the user to also
+  // find and enable the debug_logging toggle first. Remove this carve-out
+  // once that investigation concludes.
   app.get('/logmod', (req, res) => {
-    debug(`[iframe] ${String(req.query.m ?? '')}`);
+    const msg = String(req.query.m ?? '');
+    if (msg.startsWith('[docstate]')) console.error(msg);
+    else debug(`[iframe] ${msg}`);
     res.type('application/javascript').send('export default 1;');
   });
 
@@ -757,7 +763,7 @@ async function main(): Promise<void> {
     {
       title: 'Compress PDF',
       annotations: { destructiveHint: true },
-      description: 'Open a PDF in the editor and compress it. Accepts path (required), compression (min/low/medium/high/max, default: medium), and optional outputPath. The editor performs compression using the browser-side PDF engine.',
+      description: 'Open a PDF in the editor and compress it. Accepts path (required), compression (min/low/medium/high/max, default: medium), and optional outputPath. The editor performs compression using the browser-side PDF engine. This call returns immediately once compression starts, before it finishes — call get_last_operation_result afterward for the confirmed before/after size.',
       inputSchema: {
         path: z.string().describe("Absolute path to a PDF file within the user's allowed document folders"),
         compression: z.enum(['min', 'low', 'medium', 'high', 'max'])
@@ -791,6 +797,13 @@ async function main(): Promise<void> {
         filePath,
         command: { type: 'compress_pdf', compression: compression ?? 'medium', outputPath: savePath },
       };
+      // RDB-7811: unlike display_pdf, this tool never flagged a doc-open as
+      // pending — so a read-only tool (e.g. read_document_information) called
+      // around the same time could race past get_viewer_command's pending-open
+      // guard and run against whatever document was active before this open,
+      // instead of waiting for the switch this call is about to trigger.
+      shared.setDocOpenPending(true);
+      shared.setViewerCommand(null);
       shared.setOpenTarget(structured);
       return {
         content: [
@@ -808,7 +821,7 @@ async function main(): Promise<void> {
     {
       title: 'Merge PDFs',
       annotations: { destructiveHint: true },
-      description: 'Open the first PDF in the editor and merge all listed PDFs into one. Accepts paths (array of absolute PDF paths, min 2) and optional outputPath.',
+      description: 'Open the first PDF in the editor and merge all listed PDFs into one. Accepts paths (array of absolute PDF paths, min 2) and optional outputPath. This call returns immediately once the merge starts, before it finishes — call get_last_operation_result afterward for the confirmed total page count.',
       inputSchema: {
         paths: z.array(z.string()).min(2).describe('Absolute paths to PDF files to merge, in order'),
         outputPath: z.string().optional().describe('Where to save the merged file. Defaults to <firstName>_merged.pdf next to the first file'),
@@ -844,6 +857,10 @@ async function main(): Promise<void> {
         filePath: firstPath,
         command: { type: 'merge_pdf', files, outputPath: savePath },
       };
+      // RDB-7811: see compress_pdf above — flag the open as pending so a
+      // concurrent read-only tool call can't race ahead of the switch.
+      shared.setDocOpenPending(true);
+      shared.setViewerCommand(null);
       shared.setOpenTarget(structured);
       return {
         content: [
@@ -861,7 +878,7 @@ async function main(): Promise<void> {
     {
       title: 'Split PDF',
       annotations: { destructiveHint: true },
-      description: 'Open a PDF in the editor and split it into multiple files by page ranges or equal chunks.',
+      description: 'Open a PDF in the editor and split it into multiple files by page ranges or equal chunks. This call returns immediately once the split starts, before it finishes — call get_last_operation_result afterward for the confirmed actual source page count and output files.',
       inputSchema: {
         path: z.string().describe("Absolute path to the PDF file to split"),
         ranges: z.array(z.string()).optional().describe('Page ranges for each output file, e.g. ["1-3","4-6","7"]. Supports ranges (1-3), comma lists (1,3,5), or single pages (2).'),
@@ -896,6 +913,13 @@ async function main(): Promise<void> {
         filePath,
         command: { type: 'split_pdf', ranges, pagesPerFile, outputDir: outDir, baseName },
       };
+      // RDB-7811: see compress_pdf above — flag the open as pending so a
+      // concurrent read-only tool call can't race ahead of the switch. This
+      // is the exact gap that let read_document_information report the
+      // PREVIOUS document's metadata while a split_pdf-triggered open to a
+      // different file was still in flight.
+      shared.setDocOpenPending(true);
+      shared.setViewerCommand(null);
       shared.setOpenTarget(structured);
       return {
         content: [
@@ -1415,7 +1439,7 @@ async function main(): Promise<void> {
     {
       title: 'Read Document Information',
       annotations: { readOnlyHint: true },
-      description: 'Read metadata of the currently open PDF: page count, title, author, creator, producer, creation and modification dates, file size in bytes, and status flags (isSigned, isModified, isReadOnly).',
+      description: 'Read metadata of the CURRENTLY OPEN PDF (returned as fileName/filePath, so check those match the file you actually care about): page count, title, author, creator, producer, creation and modification dates, file size in bytes, and status flags (isSigned, isModified, isReadOnly). This does NOT accept a path — if the file you want info about is not already open (e.g. before planning split_pdf ranges for a file you have not opened yet), call display_pdf/split_pdf/etc. on it FIRST, then call this. Calling this before opening the target file returns a DIFFERENT document\'s metadata, not an error.',
     },
     async () =>
       pollViewerResult<Record<string, unknown>>(
@@ -2578,10 +2602,25 @@ async function main(): Promise<void> {
       title: 'Get Viewer Command',
       annotations: { readOnlyHint: false, destructiveHint: false },
       description: 'Poll for a pending viewer command (rotate, annotate, etc.)',
+      inputSchema: { token: z.string().optional() },
       _meta: { ui: { resourceUri, visibility: ['app'] as const } },
     },
-    async () => {
+    async ({ token }) => {
       if (shared.isDocOpenPending()) {
+        return { content: [{ type: 'text' as const, text: JSON.stringify({ command: null }) }] };
+      }
+      // RDB-7811: earlier chat turns' display_pdf/split_pdf/etc. renders leave
+      // their widget iframe mounted (scrolled out of view, not destroyed), and
+      // each one independently polls this same shared command channel — with
+      // no check here, whichever stale widget's poller tick won the race
+      // answered with ITS OWN long-since-irrelevant document, observed as
+      // read_document_info's answer flipping between several previously
+      // opened files within seconds. Only the widget matching the most
+      // recently minted open target is the current one; every other caller —
+      // including ones with no token at all, from a widget build that
+      // predates this check — must get nothing.
+      const latest = shared.getOpenTarget();
+      if (!token || (latest?.token && latest.token !== token)) {
         return { content: [{ type: 'text' as const, text: JSON.stringify({ command: null }) }] };
       }
       const cmd = shared.takeViewerCommand();
@@ -2635,6 +2674,58 @@ async function main(): Promise<void> {
         }
       }
       return { content: [{ type: 'text' as const, text: 'ok' }] };
+    },
+  );
+
+  // RDB-7811: split_pdf/merge_pdf/compress_pdf must return immediately to
+  // deliver the open target to the widget (ontoolresult only fires once the
+  // host has actually delivered that response) — so their own tool response
+  // can't carry the real outcome; the operation is still running when they
+  // return. Without a reliable way to learn what actually happened, the model
+  // was left to guess, and observably reused a stale answer from an earlier,
+  // unrelated read_document_information call instead. This tool waits for the
+  // widget's actual completion report and returns the confirmed result.
+  server.registerTool(
+    'get_last_operation_result',
+    {
+      title: 'Get Last Operation Result',
+      annotations: { readOnlyHint: true },
+      description: 'Get the confirmed outcome of the most recent split_pdf, merge_pdf, or compress_pdf call. Those tools return immediately once the operation starts (before it finishes) — call this afterward to learn the actual result (real source page count and output files for split, real merged page count for merge, real before/after size for compress) instead of assuming or repeating an earlier answer.',
+    },
+    async () => {
+      if (shared.isDocOpenPending()) {
+        const openDeadline = Date.now() + DOC_OPEN_GRACE_CAP_MS;
+        while (shared.isDocOpenPending() && Date.now() < openDeadline) {
+          await new Promise<void>((r) => setTimeout(r, 300));
+        }
+      }
+      const deadline = Date.now() + 60_000;
+      while (Date.now() < deadline) {
+        const pr = shared.peekViewerResult();
+        if (pr && (pr.type === 'split_done' || pr.type === 'merge_done' || pr.type === 'compress_done')) {
+          shared.clearViewerResult();
+          const d = pr.data as Record<string, any>;
+          if (!d.success) {
+            return { content: [{ type: 'text' as const, text: `Operation failed: ${d.error ?? 'unknown error'}` }], isError: true };
+          }
+          if (pr.type === 'split_done') {
+            const fileList = ((d.files ?? []) as Array<{ path: string; pages: number }>)
+              .map((f) => `${f.path} [${f.pages} page${f.pages !== 1 ? 's' : ''}]`)
+              .join('\n');
+            return { content: [{ type: 'text' as const, text: `Split ${d.sourcePages} source page(s) into ${d.files?.length ?? 0} file(s):\n${fileList}` }] };
+          }
+          if (pr.type === 'merge_done') {
+            return { content: [{ type: 'text' as const, text: `Merged ${d.fileCount} file(s) into ${d.outputPath} — ${d.totalPages} total page(s).` }] };
+          }
+          const pct = d.originalSize ? Math.round((1 - d.compressedSize / d.originalSize) * 100) : 0;
+          return { content: [{ type: 'text' as const, text: `Compressed ${d.outputPath}: ${d.originalSize} -> ${d.compressedSize} bytes (${pct}% reduction).` }] };
+        }
+        await new Promise<void>((r) => setTimeout(r, 300));
+      }
+      return {
+        content: [{ type: 'text' as const, text: 'No pending split_pdf/merge_pdf/compress_pdf result found — either none is currently running, or its result already completed and was consumed by an earlier call to this tool.' }],
+        isError: true,
+      };
     },
   );
 
