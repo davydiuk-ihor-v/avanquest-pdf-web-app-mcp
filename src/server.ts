@@ -346,15 +346,9 @@ async function startAssetServer(): Promise<{ port: number; baseUrl: string }> {
 
   // The sandbox CSP blocks fetch()/XHR to this origin but allows script
   // imports, so iframe log beacons arrive as dynamic imports with the message
-  // in the query string. Gated behind PWV_DEBUG, EXCEPT [docstate] probes
-  // (RDB-7811 investigation): those are low-volume and print unconditionally
-  // so diagnosing the "wrong document" bug doesn't require the user to also
-  // find and enable the debug_logging toggle first. Remove this carve-out
-  // once that investigation concludes.
+  // in the query string. No-op unless PWV_DEBUG is set.
   app.get('/logmod', (req, res) => {
-    const msg = String(req.query.m ?? '');
-    if (msg.startsWith('[docstate]')) console.error(msg);
-    else debug(`[iframe] ${msg}`);
+    debug(`[iframe] ${String(req.query.m ?? '')}`);
     res.type('application/javascript').send('export default 1;');
   });
 

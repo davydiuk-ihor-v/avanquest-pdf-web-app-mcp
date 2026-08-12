@@ -590,15 +590,6 @@ function activeDocumentView(): any {
 }
 let _pdfWebService: any = null;
 
-function docInfo(vm: any): string {
-  try {
-    const doc = vm?.getDocument?.();
-    if (!doc) return 'none';
-    return `name="${doc.name}" pages=${doc.getNumPages?.() ?? '?'} id=${doc.id ?? '?'}`;
-  } catch (err) {
-    return `<error: ${(err as Error).message}>`;
-  }
-}
 // Resolved by the global documentOpened$ subscription when a new document finishes loading.
 let _resolveDocOpen: (() => void) | null = null;
 
@@ -1038,7 +1029,6 @@ function initEditor(initialFile?: File): Promise<ViewerResult> {
     // documentOpened$ fires when a document is fully loaded — single authoritative subscription.
     // Handles all subsequent display_pdf calls; the first open is handled separately below.
     svc?.documentOpened$?.subscribe?.((docVm: any) => {
-      beacon(`[docstate] documentOpened$ fired: ${docInfo(docVm)}`);
       applyDefaultViewSettings(docVm);
       // Resolve the pending openPdf() Promise so commands are unblocked.
       if (_resolveDocOpen) { const r = _resolveDocOpen; _resolveDocOpen = null; r(); }
@@ -1136,10 +1126,8 @@ async function openPdf(token: string, name: string, filePath?: string): Promise<
   (app as any).callServerTool({ name: 'report_viewer_result', arguments: { type: 'doc_opened' } }).catch(() => {});
   if (!activeVm) {
     const stillActive = (svc?.getActiveDocumentViewElement?.()?.documentView as any)?.getDocument?.()?.name;
-    beacon(`[docstate] openPdf FAILED to switch: requested="${name}" stillActive="${stillActive ?? 'no document'}"`);
     throw new Error(`Viewer did not switch to "${name}" (currently showing "${stillActive ?? 'no document'}") — refusing to run the command against the wrong file.`);
   }
-  beacon(`[docstate] openPdf confirmed: requested="${name}" -> ${docInfo(activeVm)}`);
   applyDefaultViewSettings(activeVm);
   statusEl.style.display = 'none';
 }
@@ -1264,7 +1252,6 @@ function startViewerCommandPoller(): void {
       // Wait for any in-progress document open to complete before executing viewer commands.
       if (_openingDocument) try { await _openingDocument; } catch { /* ignore */ }
       await editorReady;
-      beacon(`[docstate] dispatching command="${command.type}" activeDoc=${docInfo(activeDocumentView())}`);
       if (command.type === 'rotate_pages') {
         await handleRotatePages({ angle: command.angle as number, pages: command.pages as number[] | null });
       } else if (command.type === 'add_annotation') {
@@ -1958,7 +1945,6 @@ async function handleReadDocumentInfo(): Promise<void> {
   try {
     const doc = (activeDocumentView() as any)?.getDocument?.();
     if (!doc) throw new Error('document not available');
-    beacon(`[docstate] read_document_info reading: ${docInfo(activeDocumentView())}`);
     const info: Record<string, unknown> = {
       // RDB-7811: this tool has no path argument — it always reports on
       // whichever document is currently active, which is wrong the moment
