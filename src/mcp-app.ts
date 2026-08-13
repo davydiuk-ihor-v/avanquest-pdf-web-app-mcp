@@ -3787,6 +3787,7 @@ type ToolCommand = {
   pagesPerFile?: number;
   outputDir?: string;
   baseName?: string;
+  opId?: string;
 };
 
 // ── Fullscreen arbitration across sibling widget iframes ────────────────────
@@ -3803,6 +3804,22 @@ type ToolCommand = {
 // button.
 function shouldAutoFullscreen(token: string): Promise<boolean> {
   return (app as any).callServerTool({ name: 'claim_fullscreen', arguments: { token } })
+    .then((r: { content?: Array<{ text?: string }> }) => {
+      const parsed = JSON.parse(r.content?.[0]?.text ?? '{}') as { allow?: boolean };
+      return parsed.allow ?? true;
+    })
+    .catch(() => true);
+}
+
+// RDB-7710: same remount problem as fullscreen arbitration above, but for the
+// command itself — ontoolresult re-fires with the same open target (and thus
+// the same command) on every remount, not just on a genuinely new tool call.
+// Without this, a scroll-back-into-view or reopening an old chat re-ran
+// compress_pdf/merge_pdf/split_pdf and silently overwrote the output file.
+// Arbitrated server-side (claim_operation, mirroring claim_fullscreen) so it
+// survives this widget instance being torn down and remounted fresh.
+function shouldRunOperation(opId: string, outputPath?: string): Promise<boolean> {
+  return (app as any).callServerTool({ name: 'claim_operation', arguments: { opId, outputPath } })
     .then((r: { content?: Array<{ text?: string }> }) => {
       const parsed = JSON.parse(r.content?.[0]?.text ?? '{}') as { allow?: boolean };
       return parsed.allow ?? true;
@@ -3833,8 +3850,10 @@ function parseOpenTargetFromContent(result: { content?: Array<{ text?: string }>
 
 app.ontoolresult = async (result) => {
   let data = (result as { structuredContent?: OpenTarget }).structuredContent;
+  beacon(`ontoolresult fired: structuredContent.command=${JSON.stringify((data as any)?.command)}`);
   if (!(data?.token && data.name)) {
     data = parseOpenTargetFromContent(result as { content?: Array<{ text?: string }> });
+    beacon(`ontoolresult: structuredContent missing token/name, fell back to content block, command=${JSON.stringify((data as any)?.command)}`);
   }
   // Last-resort fallback for hosts where neither of the above arrives (e.g. very
   // old cached widget builds): ask the server for the last-known open target.
@@ -3857,12 +3876,25 @@ app.ontoolresult = async (result) => {
           updateFullscreenBtn(r?.mode ?? 'fullscreen');
         }
       } catch (_) {}
-      if (data.command?.type === 'compress_pdf') {
-        await handleCompress(data.command.compression ?? 'medium', data.command.outputPath ?? _currentFilePath);
-      } else if (data.command?.type === 'merge_pdf') {
-        await handleMerge(data.command.files ?? [], data.command.outputPath ?? _currentFilePath);
-      } else if (data.command?.type === 'split_pdf') {
-        await handleSplit(data.command);
+      const command = data.command;
+      if (command && (command.type === 'compress_pdf' || command.type === 'merge_pdf' || command.type === 'split_pdf')) {
+        // No opId means an older cached widget build minted this command
+        // before opId existed — run it (fail open) rather than silently skip
+        // a legitimate first run.
+        beacon(`ontoolresult: about to arbitrate ${command.type} opId=${command.opId ?? '(none)'}`);
+        const allow = !command.opId || (await shouldRunOperation(command.opId, command.outputPath));
+        beacon(`ontoolresult: ${command.type} opId=${command.opId ?? '(none)'} allow=${allow}`);
+        if (allow) {
+          if (command.type === 'compress_pdf') {
+            await handleCompress(command.compression ?? 'medium', command.outputPath ?? _currentFilePath);
+          } else if (command.type === 'merge_pdf') {
+            await handleMerge(command.files ?? [], command.outputPath ?? _currentFilePath);
+          } else {
+            await handleSplit(command);
+          }
+        } else {
+          beacon(`skipped re-running ${command.type} (opId ${command.opId}) — already executed, this is a remount replay`);
+        }
       }
     }).catch((err) => {
       show(`open failed: ${(err as Error).message}\n${(err as Error).stack ?? ''}`, true);
