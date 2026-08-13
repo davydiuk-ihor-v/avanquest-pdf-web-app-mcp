@@ -3615,6 +3615,17 @@ async function handleAddFormField(data: AddFormFieldCommand): Promise<void> {
     const response = await (doc as any).createAnnotation({ pageIndex, params }) as any;
     const fieldName: string | null = response?.F?.N ?? response?.field?.[0]?.N ?? null;
 
+    // RDB-7907: passing V in the createAnnotation params above is unreliable
+    // for text fields — the engine sometimes creates the field without ever
+    // applying it, leaving the value empty until a separate update_form_field
+    // call. changeAcroformValue is the same call update_form_field already
+    // relies on to *verify* a value actually took (see tryChangeAcroform), so
+    // reinforce it here too instead of trusting the creation param alone.
+    if (fieldName && data.default_value != null && data.field_type !== 'dropdown' && data.field_type !== 'listbox') {
+      const target = data.field_type === 'checkbox' ? (params.V as string) : data.default_value;
+      await tryChangeAcroform(doc, fieldName, target);
+    }
+
     // For non-button types, add a plain text label above the field via createTextBlock.
     if (data.label != null && data.field_type !== 'button') {
       const fieldPdfTop = ph - (data.y / 100) * ph;

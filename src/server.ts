@@ -2186,7 +2186,7 @@ async function main(): Promise<void> {
     {
       title: 'Add Form Field',
       annotations: { readOnlyHint: false, destructiveHint: false },
-      description: 'Add a fillable form field (AcroForm widget) to a page in the currently open PDF. Position and size are percentages of page dimensions (0--100). Use x=0, width=100 to span the full page width.',
+      description: 'Add a fillable form field (AcroForm widget) to a page in the currently open PDF. Position and size are percentages of page dimensions (0--100). Use x=0, width=100 to span the full page width. The internal field name (used by update_form_field/read_form_fields) is always auto-assigned by the engine (e.g. "Text1") — there is no way to set it to a custom value; `label` only controls the visible caption text.',
       inputSchema: {
         page: z.coerce.number().int().min(1).describe('1-based page number'),
         field_type: z.enum(['text', 'checkbox', 'radio', 'dropdown', 'listbox', 'button']).describe('Field type'),
@@ -2194,7 +2194,7 @@ async function main(): Promise<void> {
         y: z.coerce.number().min(0).max(100).describe('Top position as % of page height'),
         width: z.coerce.number().min(0).max(100).describe('Width as % of page width (use 100 for full-width)'),
         height: z.coerce.number().min(0).max(100).describe('Height as % of page height'),
-        label: z.string().optional().describe('Caption / label text shown on the field'),
+        label: z.string().optional().describe('Caption / label text shown on the field. This is NOT the internal field name — the engine always auto-assigns that.'),
         default_value: z.string().optional().describe('Initial field value'),
         options: z.array(z.string()).optional().describe('Choice options for dropdown/listbox fields'),
         bg_color: z.string().optional().describe('Background color hex e.g. #FFFFFF'),
@@ -2210,7 +2210,10 @@ async function main(): Promise<void> {
         15_000,
         (d) => {
           if (!d.success) return nok(`Error: ${d.error}`);
-          return ok(`Form field added to page ${page}${d.field_name ? ` (field name: "${d.field_name}")` : ''}.`);
+          const nameNote = label
+            ? ` Note: the internal field name is engine-assigned and cannot be set to "${label}" — that was applied as the visible label instead. Use "${d.field_name}" for update_form_field/read_form_fields.`
+            : '';
+          return ok(`Form field added to page ${page}${d.field_name ? ` (field name: "${d.field_name}")` : ''}.${nameNote}`);
         },
       );
     },
