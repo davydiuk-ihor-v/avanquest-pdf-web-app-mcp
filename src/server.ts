@@ -298,6 +298,45 @@ function saveFullscreenGrantedTokens(tokens: Set<string>): void {
   } catch { /* non-fatal — worst case, next restart re-grants fullscreen once */ }
 }
 
+// RDB-7710: same remount problem as fullscreen arbitration above, but for
+// file-writing commands (compress_pdf/merge_pdf/split_pdf) instead of the
+// display mode. A widget's ontoolresult re-fires with the same open target —
+// carrying the same command — on every remount (scrolling back into view,
+// reopening a chat much later), and mcp-app.ts used to just run the command
+// again each time, silently overwriting the output file. Each such command is
+// now tagged with a unique opId when minted (see compress_pdf/merge_pdf/
+// split_pdf below); the widget claims it here before running, exactly once per
+// opId — every later claim for the same opId (a remount) is denied and the
+// widget only re-displays the document, without repeating the write.
+const EXECUTED_OPS_STATE_PATH = path.join(os.homedir(), '.avanquest-pdf-viewer', 'executed-operations.json');
+const EXECUTED_OPS_STATE_MAX = 500;
+
+// opId -> the output file it was expected to produce (empty string if the
+// command has no single output path, e.g. split_pdf). Recording the path lets
+// claim_operation re-allow a remount if that file is later gone from disk
+// (user deleted the compressed/merged output) instead of forever refusing to
+// recreate it just because this opId ran once before.
+type ExecutedOps = Record<string, string>;
+
+function loadExecutedOps(): ExecutedOps {
+  try {
+    const parsed = JSON.parse(readFileSync(EXECUTED_OPS_STATE_PATH, 'utf-8')) as unknown;
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed as ExecutedOps;
+    return {};
+  } catch {
+    return {};
+  }
+}
+
+function saveExecutedOps(ops: ExecutedOps): void {
+  try {
+    mkdirSync(path.dirname(EXECUTED_OPS_STATE_PATH), { recursive: true });
+    const entries = Object.entries(ops);
+    const trimmed = entries.length > EXECUTED_OPS_STATE_MAX ? entries.slice(entries.length - EXECUTED_OPS_STATE_MAX) : entries;
+    writeFileSync(EXECUTED_OPS_STATE_PATH, JSON.stringify(Object.fromEntries(trimmed)), 'utf-8');
+  } catch { /* non-fatal — worst case, a remount repeats the write once more */ }
+}
+
 async function downloadPdfFromUrl(pdfUrl: string): Promise<{ tempPath: string; name: string }> {
   const parsed = new URL(pdfUrl);
   const urlBasename = path.basename(parsed.pathname) || 'document';
@@ -789,8 +828,9 @@ async function main(): Promise<void> {
         name,
         token,
         filePath,
-        command: { type: 'compress_pdf', compression: compression ?? 'medium', outputPath: savePath },
+        command: { type: 'compress_pdf', compression: compression ?? 'medium', outputPath: savePath, opId: randomUUID() },
       };
+      console.error(`[compress_pdf] minted opId=${structured.command.opId} token=${token} outputPath=${savePath}`);
       // RDB-7811: unlike display_pdf, this tool never flagged a doc-open as
       // pending — so a read-only tool (e.g. read_document_information) called
       // around the same time could race past get_viewer_command's pending-open
@@ -849,8 +889,9 @@ async function main(): Promise<void> {
         name: files[0].name,
         token: files[0].token,
         filePath: firstPath,
-        command: { type: 'merge_pdf', files, outputPath: savePath },
+        command: { type: 'merge_pdf', files, outputPath: savePath, opId: randomUUID() },
       };
+      console.error(`[merge_pdf] minted opId=${structured.command.opId} outputPath=${savePath}`);
       // RDB-7811: see compress_pdf above — flag the open as pending so a
       // concurrent read-only tool call can't race ahead of the switch.
       shared.setDocOpenPending(true);
@@ -905,8 +946,9 @@ async function main(): Promise<void> {
         name,
         token,
         filePath,
-        command: { type: 'split_pdf', ranges, pagesPerFile, outputDir: outDir, baseName },
+        command: { type: 'split_pdf', ranges, pagesPerFile, outputDir: outDir, baseName, opId: randomUUID() },
       };
+      console.error(`[split_pdf] minted opId=${structured.command.opId} outputDir=${outDir}`);
       // RDB-7811: see compress_pdf above — flag the open as pending so a
       // concurrent read-only tool call can't race ahead of the switch. This
       // is the exact gap that let read_document_information report the
@@ -2582,6 +2624,42 @@ async function main(): Promise<void> {
       if (allow) {
         granted.add(key);
         saveFullscreenGrantedTokens(granted);
+      }
+      return {
+        content: [{ type: 'text' as const, text: JSON.stringify({ allow }) }],
+      };
+    },
+  );
+
+  registerAppTool(
+    server,
+    'claim_operation',
+    {
+      title: 'Claim Operation',
+      annotations: { readOnlyHint: false, destructiveHint: false },
+      description: 'Internal: arbitrate whether a widget iframe is allowed to run a file-writing command (compress_pdf/merge_pdf/split_pdf). Grants once per opId; later claims for the same opId (a remount from scrolling or reopening the chat) are denied so the output file is not silently overwritten again — unless that output file is no longer on disk (e.g. the user deleted it), in which case the operation is allowed to run again to recreate it.',
+      inputSchema: { opId: z.string().optional(), outputPath: z.string().optional() },
+      _meta: { ui: { resourceUri, visibility: ['app'] as const } },
+    },
+    async ({ opId, outputPath }) => {
+      // No opId (older cached widget build predating this tool, or a command
+      // that never carried one) — fail open rather than silently skip a
+      // legitimate first run.
+      if (!opId) {
+        console.error('[claim_operation] no opId in request — failing open (allow=true)');
+        return { content: [{ type: 'text' as const, text: JSON.stringify({ allow: true }) }] };
+      }
+      const executed = loadExecutedOps();
+      const priorPath = executed[opId];
+      // Never claimed before -> allow. Claimed before but we don't know its
+      // output path (e.g. split_pdf, multiple files) -> deny, same as before.
+      // Claimed before with a known output path -> allow again only if that
+      // file is now missing from disk.
+      const allow = priorPath === undefined || (priorPath !== '' && !existsSync(priorPath));
+      console.error(`[claim_operation] opId=${opId} priorPath=${priorPath ?? '(none)'} allow=${allow} (${Object.keys(executed).length} executed opIds on file)`);
+      if (allow) {
+        executed[opId] = outputPath ?? priorPath ?? '';
+        saveExecutedOps(executed);
       }
       return {
         content: [{ type: 'text' as const, text: JSON.stringify({ allow }) }],
