@@ -2269,11 +2269,27 @@ async function handleReadBookmarks(): Promise<void> {
   }
 }
 
+// Resolves the sibling array a bookmark would land in for a given parent
+// path (an array of 0-based child indices, root when empty) — walks doc's
+// live bookmark tree the same way handleReadBookmarks does.
+function getBookmarkSiblings(doc: any, parentPath: number[]): any[] {
+  let items: any[] = doc.bookmarks ?? [];
+  for (const idx of parentPath) {
+    items = items[idx]?.items ?? [];
+  }
+  return items;
+}
+
 async function handleAddBookmark(data: { page: number; title: string | null; parentPath: number[] }): Promise<void> {
   try {
     const doc = (activeDocumentView() as any)?.getDocument?.();
     if (!doc) throw new Error('document not available');
-    await doc.addBookmark({ pageIndex: data.page - 1, title: data.title ?? `Page ${data.page}`, parentIndex: data.parentPath });
+    // RDB-7869: without an explicit index, the engine inserts each new
+    // bookmark at the front of its parent's children instead of the end, so
+    // several add_bookmark calls in one request land in reverse order.
+    // Append explicitly by passing the current sibling count as the index.
+    const siblingCount = getBookmarkSiblings(doc, data.parentPath).length;
+    await doc.addBookmark({ pageIndex: data.page - 1, title: data.title ?? `Page ${data.page}`, parentIndex: data.parentPath, index: siblingCount });
     await (app as any).callServerTool({
       name: 'report_viewer_result',
       arguments: { type: 'add_bookmark', json: JSON.stringify({ success: true }) },
@@ -2731,7 +2747,7 @@ async function handleReadFormFields(): Promise<void> {
     const raw: any[] = doc.acroforms ?? [];
     // Read the real on-state values of button fields once so checkboxes and, in
     // particular, radio groups report the exact values needed to select them.
-    const onValuesByField = await collectButtonOnValues(doc);
+    const { map: onValuesByField, debugWidgets } = await collectButtonOnValues(doc);
     const fields = raw.map((f: any) => {
       let type = f.type as string;
       if (type === 'Tx') type = 'text';
@@ -2757,7 +2773,14 @@ async function handleReadFormFields(): Promise<void> {
         if (type === 'radio' || onValues.length > 1) {
           // Radio group: expose the selectable option values in order so the
           // caller can pass an exact value or a 1-based index to update_form_field.
-          if (onValues.length > 0) entry.options = onValues.slice();
+          if (onValues.length > 0) {
+            entry.options = onValues.slice();
+          } else {
+            // RDB-7889: nothing pre-selected, so no on-value was discoverable
+            // via V on any widget — dump the raw widget JSON so the actual
+            // shape is visible instead of failing silently.
+            entry._debug_no_options_raw_widgets = debugWidgets.get(f.fieldName) ?? [];
+          }
         } else if (onValues.length === 1) {
           // Single checkbox: report its on-value ("yes"/"true"/"1" also work).
           entry.on_value = onValues[0];
@@ -2809,11 +2832,20 @@ async function tryChangeAcroform(doc: any, field: string, value: string): Promis
 // so we must read it rather than guess. A single scan returns a map from field
 // name to its distinct on-values, in widget order (which matches the visual
 // order of the radio options — index i is the (i+1)-th option).
-async function collectButtonOnValues(doc: any): Promise<Map<string, string[]>> {
+// RDB-7889 diagnostic: `debugWidgets`, keyed the same as the returned map,
+// collects the raw annotation JSON for every widget that contributed nothing
+// to its field's on-values (V was empty/"Off"). V only reflects a widget's
+// CURRENT toggle state, so a radio option that has never been selected can't
+// be discovered through it — surfaced here so read_form_fields can show the
+// real widget shape and reveal whether the engine exposes each widget's own
+// possible on-value under some other (untyped) key, e.g. an AP/N
+// appearance-state dictionary, instead of guessing blind.
+async function collectButtonOnValues(doc: any): Promise<{ map: Map<string, string[]>; debugWidgets: Map<string, unknown[]> }> {
   const map = new Map<string, string[]>();
+  const debugWidgets = new Map<string, unknown[]>();
   const pdfEditor = doc?.pdfEditor;
   const docId = doc?.id;
-  if (!pdfEditor || docId === undefined) return map;
+  if (!pdfEditor || docId === undefined) return { map, debugWidgets };
   const pageCount = (doc.getNumPages?.() ?? 0) as number;
   for (let pi = 0; pi < pageCount; pi++) {
     let annots: any[] = [];
@@ -2827,17 +2859,22 @@ async function collectButtonOnValues(doc: any): Promise<Map<string, string[]>> {
       const field = typeof a.P === 'string' ? a.P : '';
       if (!field) continue;
       const v = typeof a.V === 'string' ? a.V : '';
-      if (v === '' || v.toLowerCase() === 'off') continue;
+      if (v === '' || v.toLowerCase() === 'off') {
+        let dbg = debugWidgets.get(field);
+        if (!dbg) { dbg = []; debugWidgets.set(field, dbg); }
+        dbg.push(a);
+        continue;
+      }
       let list = map.get(field);
       if (!list) { list = []; map.set(field, list); }
       if (!list.includes(v)) list.push(v);
     }
   }
-  return map;
+  return { map, debugWidgets };
 }
 
 async function getButtonOnValues(doc: any, fieldName: string): Promise<string[]> {
-  const map = await collectButtonOnValues(doc);
+  const { map } = await collectButtonOnValues(doc);
   return map.get(fieldName) ?? [];
 }
 
@@ -2924,9 +2961,18 @@ async function handleUpdateFormField(data: { field_name: string; value: string }
           if (idx >= 0 && idx < onValues.length) target = onValues[idx];
         }
         if (!target) {
-          const list = onValues.length > 0
-            ? `Its options (in order) are: ${onValues.map((v, i) => `${i + 1}=${v}`).join(', ')}.`
-            : 'No selectable options were found on its widgets.';
+          let list: string;
+          if (onValues.length > 0) {
+            list = `Its options (in order) are: ${onValues.map((v, i) => `${i + 1}=${v}`).join(', ')}.`;
+          } else {
+            // RDB-7889 diagnostic: surface the raw widget annotations in the
+            // error text itself — the most reliable channel we have, since
+            // log-based debugging (beacon/console.error) is currently not
+            // reaching us. Remove once the real fix lands.
+            const { debugWidgets } = await collectButtonOnValues(doc);
+            const raw = debugWidgets.get(data.field_name) ?? [];
+            list = `No selectable options were found on its widgets. [debug: ${raw.length} widget(s) found for this field, raw=${JSON.stringify(raw)}]`;
+          }
           throw new Error(`"${data.field_name}" is a radio group; pass one of its option values or a 1-based index. ${list}`);
         }
         appliedValue = target;
