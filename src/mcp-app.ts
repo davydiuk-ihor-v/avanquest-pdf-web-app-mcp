@@ -192,7 +192,12 @@ try {
 // missing worker still reports through its own catch/report path.
 function isBenignVendorError(msg: string): boolean {
   return msg.includes('Clipboard') || msg.includes('clipboard')
-    || msg.includes('Web Worker not found');
+    || msg.includes('Web Worker not found')
+    // Standard browser behavior, not a bug: fires whenever a ResizeObserver
+    // callback itself changes layout enough to need another observation
+    // pass in the same frame (e.g. the page thumbnail grid reflowing after
+    // its own resize). Harmless and unrelated to any operation's outcome.
+    || msg.includes('ResizeObserver loop completed with undelivered notifications');
 }
 
 window.addEventListener('error', (e) => {
@@ -1017,7 +1022,12 @@ function initEditor(initialFile?: File): Promise<ViewerResult> {
         },
       },
       ...(initialFile ? { initialDocument: { file: initialFile } } : {}),
-      onDownloadFile: async (file: File) => {
+      // Renamed from onDownloadFile in @avanquest/pdf-web-viewer 0.10.4's
+      // rework of save/export handling (IDeviceConfig/customProviders) — same
+      // (file: File) => void shape, still fires for Download and every
+      // generated artefact (extracted images, split/compress output, etc.)
+      // since we don't implement deviceConfig.
+      onExportFile: async (file: File) => {
         const bytes = new Uint8Array(await file.arrayBuffer());
         await saveFileBytes(bytes, _currentFilePath || file.name);
       },
