@@ -1611,11 +1611,14 @@ async function main(): Promise<void> {
           shared.clearViewerResult();
           if (d.error) return { content: [{ type: 'text' as const, text: `Error: ${d.error}` }], isError: true };
           return {
-            content: [{
-              type: 'image' as const,
-              data: d.base64 ?? '',
-              mimeType: 'image/png',
-            }],
+            content: [
+              { type: 'text' as const, text: `Page ${page} rendered as PNG.` },
+              {
+                type: 'image' as const,
+                data: d.base64 ?? '',
+                mimeType: 'image/png',
+              },
+            ],
           };
         }
       }
