@@ -2,7 +2,7 @@
   "manifest_version": "0.4",
   "name": "avanquest-pdf-mcp-editor",
   "display_name": "Avanquest PDF Editor",
-  "version": "0.4.300",
+  "version": "0.4.302",
   "description": "View and edit PDF files inside Claude Desktop using the Avanquest PDF web viewer.",
   "long_description": "Provides a display_pdf tool that opens a local PDF file in an interactive editor rendered inline in the Claude Desktop chat. Powered by @avanquest/pdf-web-viewer.",
   "author": {
@@ -310,6 +310,30 @@
     {
       "name": "insert_page_number",
       "description": "Add page numbers to the currently open PDF. Format: plain (%1%), dash (-%1%-), Page N, N of M, N/M, Page N of M. Position: top/bottom × left/center/right. Font: family, size (pt), color (hex). Range: specific pages or all. Start number: offset for multi-file documents."
+    },
+    {
+      "name": "claim_fullscreen",
+      "description": "Internal: arbitrate whether a widget iframe is allowed to auto-enter fullscreen."
+    },
+    {
+      "name": "claim_operation",
+      "description": "Internal: arbitrate whether a widget iframe is allowed to run a file-writing command (compress_pdf/merge_pdf/split_pdf)."
+    },
+    {
+      "name": "get_pending_open",
+      "description": "Internal: return the last PDF open target for the app iframe."
+    },
+    {
+      "name": "get_viewer_command",
+      "description": "Internal: poll for a pending viewer command."
+    },
+    {
+      "name": "read_pdf_bytes_by_token",
+      "description": "Internal: read PDF bytes for the viewer iframe via the MCP channel."
+    },
+    {
+      "name": "report_viewer_result",
+      "description": "Internal: report a result from the viewer to the server."
     }
   ],
   "compatibility": {

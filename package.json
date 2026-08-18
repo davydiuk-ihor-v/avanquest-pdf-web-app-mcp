@@ -1,6 +1,6 @@
 {
   "name": "avanquest-pdf-mcp-editor",
-  "version": "0.4.300",
+  "version": "0.4.302",
   "description": "Claude Desktop MCP App that renders PDFs with @avanquest/pdf-web-viewer inside the chat",
   "private": true,
   "type": "module",
@@ -15,8 +15,8 @@
   },
   "dependencies": {
     "@avanquest/pdf-web-viewer": "https://cdn-developers.avanquest.com/websdk-files/packages/pdf-web-viewer/0.10.1/avanquest-pdf-web-viewer-0.10.1.tgz",
-    "@modelcontextprotocol/ext-apps": "^1.7.1",
-    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@modelcontextprotocol/ext-apps": "^1.7.5",
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "cors": "^2.8.6",
     "express": "^5.2.1",
     "zod": "^4.3.6"

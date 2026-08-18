@@ -642,16 +642,14 @@ async function main(): Promise<void> {
         path: z.string().optional().describe("Absolute path to a PDF file within the user's allowed document folders"),
         url: z.string().optional().describe('URL of a remote PDF to download and open (http or https)'),
       },
-      // outputSchema is REQUIRED for the host to forward structuredContent to the
-      // app iframe. Newer Claude Desktop strips structuredContent from the
-      // tool-result notification when a tool declares none, which left the viewer
-      // blank (openPdf never received url/token). See ontoolresult in mcp-app.ts.
-      outputSchema: {
-        url: z.string(),
-        name: z.string(),
-        token: z.string(),
-        filePath: z.string(),
-      },
+      // outputSchema used to be declared here (structuredContent forwarding to
+      // the app iframe on older Claude Desktop) but was dropped for RDB-7878:
+      // it's what makes the SDK stamp a JSON Schema `$schema` dialect the newer
+      // Cowork validator rejects outright at attach time (see PR
+      // modelcontextprotocol/typescript-sdk#2653), and ontoolresult's own
+      // debug logging confirms structuredContent never actually arrives there
+      // regardless — parseOpenTargetFromContent's content-block channel (see
+      // openTargetContentBlock below) is what widgets have really relied on.
       _meta: { ui: { resourceUri } },
     },
     async ({ path: requestedPath, url: pdfUrl }) => {
@@ -804,13 +802,7 @@ async function main(): Promise<void> {
           .describe('Compression level: max=maximum compression (smallest file, lower quality), min=minimum compression (largest file, best quality). Default: medium'),
         outputPath: z.string().optional().describe('Where to save the compressed file. Defaults to original filename with _compressed suffix'),
       },
-      outputSchema: {
-        url: z.string(),
-        name: z.string(),
-        token: z.string(),
-        filePath: z.string(),
-        command: z.record(z.string(), z.unknown()).optional(),
-      },
+      // RDB-7878: no outputSchema — see the note on display_pdf above.
       _meta: { ui: { resourceUri } },
     },
     async ({ path: requestedPath, compression, outputPath }) => {
@@ -860,13 +852,7 @@ async function main(): Promise<void> {
         paths: z.array(z.string()).min(2).describe('Absolute paths to PDF files to merge, in order'),
         outputPath: z.string().optional().describe('Where to save the merged file. Defaults to <firstName>_merged.pdf next to the first file'),
       },
-      outputSchema: {
-        url: z.string(),
-        name: z.string(),
-        token: z.string(),
-        filePath: z.string(),
-        command: z.record(z.string(), z.unknown()).optional(),
-      },
+      // RDB-7878: no outputSchema — see the note on display_pdf above.
       _meta: { ui: { resourceUri } },
     },
     async ({ paths, outputPath }) => {
@@ -920,13 +906,7 @@ async function main(): Promise<void> {
         pagesPerFile: z.coerce.number().int().min(1).optional().describe('Split into equal chunks of N pages each. Alternative to ranges.'),
         outputDir: z.string().optional().describe('Directory for output files. Defaults to same directory as the input file.'),
       },
-      outputSchema: {
-        url: z.string(),
-        name: z.string(),
-        token: z.string(),
-        filePath: z.string(),
-        command: z.record(z.string(), z.unknown()).optional(),
-      },
+      // RDB-7878: no outputSchema — see the note on display_pdf above.
       _meta: { ui: { resourceUri } },
     },
     async ({ path: requestedPath, ranges, pagesPerFile, outputDir }) => {
