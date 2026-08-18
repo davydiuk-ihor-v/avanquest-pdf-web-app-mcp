@@ -3253,15 +3253,23 @@ async function handleExtractPages(data: { Range: string[] | null; outputPath: st
     showSaveProgress('Extracting pages');
     const doc = (activeDocumentView() as any)?.getDocument?.();
     if (!doc) throw new Error('document not available');
+    const totalPages = (doc as any).getNumPages?.() ?? 1;
     // See handleDeleteWatermark: null = whole document, expand to 1-N.
-    const Range = data.Range && data.Range.length > 0 ? data.Range : [`1-${(doc as any).getNumPages?.() ?? 1}`];
+    const Range = data.Range && data.Range.length > 0 ? data.Range : [`1-${totalPages}`];
     const raw = await (doc as any).extractPages({ Range });
     const bytes = new Uint8Array(raw instanceof ArrayBuffer ? raw : (raw as ArrayBufferView).buffer);
     await saveChunked(bytes, data.outputPath, 'Saving extracted PDF');
     showSaveSuccess('Pages extracted successfully', data.outputPath);
+    // RDB-7894: report_viewer_result gets auto-stamped with the SOURCE
+    // document's _pageCount (RDB-7843's augmentation, for state-freshness on
+    // mutating commands) — but extract_pages doesn't mutate/replace the open
+    // document, so that count is the wrong one to show for the new file.
+    // Compute the real extracted count from the resolved ranges instead.
+    const extractedPages = new Set<string>();
+    for (const r of Range) for (const p of parseSplitRange(r, totalPages)) extractedPages.add(p);
     await (app as any).callServerTool({
       name: 'report_viewer_result',
-      arguments: { type: 'extract_pages', json: JSON.stringify({ success: true, path: data.outputPath }) },
+      arguments: { type: 'extract_pages', json: JSON.stringify({ success: true, path: data.outputPath, extractedPageCount: extractedPages.size }) },
     });
   } catch (err) {
     showSaveError(`Extract pages failed: ${err instanceof Error ? err.message : String(err)}`);
