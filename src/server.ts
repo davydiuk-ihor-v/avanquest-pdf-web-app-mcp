@@ -2372,13 +2372,16 @@ async function main(): Promise<void> {
     async ({ range, output_path, file_name }) => {
       const defaultDir = DEFAULT_PDF_DIR;
       const savePath = output_path?.trim() || path.join(defaultDir, file_name?.trim() || 'extracted_pages.pdf');
-      return pollViewerResult<{ success: boolean; path?: string; error?: string }>(
+      return pollViewerResult<{ success: boolean; path?: string; extractedPageCount?: number; error?: string }>(
         { type: 'extract_pages', Range: normalizeRangeList(range), outputPath: savePath },
         'extract_pages',
         30_000,
         (d) => {
           if (d.error) return nok(`Error: ${d.error}`);
-          return ok(`Pages extracted to: ${d.path}`);
+          const suffix = typeof d.extractedPageCount === 'number'
+            ? ` [${d.extractedPageCount} page${d.extractedPageCount !== 1 ? 's' : ''}]`
+            : '';
+          return ok(`Pages extracted to: ${d.path}${suffix}`);
         },
       );
     },
