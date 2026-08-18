@@ -18,7 +18,7 @@ const outFile = process.argv[2] ?? resolve(root, `${pkg.name}.mcpb`);
 rmSync(stagingDir, { recursive: true, force: true });
 mkdirSync(stagingDir, { recursive: true });
 
-for (const entry of ['dist', 'manifest.json', 'icon.png', 'LICENSE', 'patches']) {
+for (const entry of ['dist', 'manifest.json', 'icon.png', 'LICENSE']) {
   const src = resolve(root, entry);
   if (existsSync(src)) cpSync(src, resolve(stagingDir, entry), { recursive: true });
 }
@@ -39,20 +39,6 @@ execFileSync('npm', ['install', '--omit=dev', '--no-audit', '--no-fund', '--no-p
   stdio: 'inherit',
   shell: true,
 });
-
-// patch-package is a devDependency (not installed above) and the trimmed
-// package.json has no postinstall hook, so the SDK patch in patches/ (fixes
-// the JSON Schema draft version emitted for tool input/output schemas — see
-// patches/@modelcontextprotocol+sdk+*.patch) would otherwise silently be
-// dropped from every packed .mcpb. Apply it explicitly via npx instead.
-if (existsSync(resolve(stagingDir, 'patches'))) {
-  console.log('Applying patches to staged dependencies...');
-  execFileSync('npx', ['--yes', 'patch-package'], {
-    cwd: stagingDir,
-    stdio: 'inherit',
-    shell: true,
-  });
-}
 
 console.log('Packing .mcpb from staging...');
 execFileSync('mcpb', ['pack', stagingDir, outFile], {
