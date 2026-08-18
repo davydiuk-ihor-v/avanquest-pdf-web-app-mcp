@@ -968,6 +968,13 @@ async function main(): Promise<void> {
     'delete_page_number', 'insert_page_number', 'delete_text_blocks', 'set_security_permissions',
     'search_and_redact', 'format_text', 'add_text_to_page', 'add_form_field', 'format_selected_text',
   ]);
+  // RDB-7894: these produce a standalone new file whose own response text
+  // already states the real outcome (including, for extract_pages, the
+  // actual extracted page count) — appending the *currently open* viewer
+  // document's page-count note here doesn't just add noise, it's actively
+  // wrong (it describes a different document than the one just produced).
+  const SKIP_DOC_NOTE_RESULT_TYPES = new Set(['extract_pages']);
+
   function docNote(isEdit = false): string {
     // The very first edit in a document's lifetime fires before the
     // debounced auto-save (mcp-app.ts) has ever completed once, so there's
@@ -1049,7 +1056,7 @@ async function main(): Promise<void> {
         if (pr.type !== resultType) continue;
         shared.clearViewerResult();
         const result = handler(pr.data as T);
-        if (!result.isError && result.content[0]) {
+        if (!result.isError && result.content[0] && !SKIP_DOC_NOTE_RESULT_TYPES.has(resultType)) {
           result.content[0] = { type: 'text' as const, text: result.content[0].text + docNote(MUTATING_RESULT_TYPES.has(resultType)) };
         }
         return result;
