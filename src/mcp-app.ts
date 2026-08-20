@@ -871,7 +871,9 @@ function showSaveDialog(defaultPath: string): Promise<string | null> {
 
     const box = document.createElement('div');
     box.style.cssText = 'background:#1e1e1e;border:1px solid #555;border-radius:8px;padding:20px;width:520px;max-width:90vw;font-family:monospace;color:#ccc';
-    box.innerHTML = `<div style="margin-bottom:12px;font-size:14px;color:#fff">Save PDF as</div>`;
+    // Generic label: this dialog is shared by every export kind (PDF Download,
+    // extracted images, split/compress output, etc.), not just the PDF itself.
+    box.innerHTML = `<div style="margin-bottom:12px;font-size:14px;color:#fff">Save file as</div>`;
 
     const input = document.createElement('input');
     input.type = 'text';
@@ -1029,7 +1031,20 @@ function initEditor(initialFile?: File): Promise<ViewerResult> {
       // since we don't implement deviceConfig.
       onExportFile: async (file: File) => {
         const bytes = new Uint8Array(await file.arrayBuffer());
-        await saveFileBytes(bytes, _currentFilePath || file.name);
+        // This single callback fires for every export kind (Download, extracted
+        // images, split/compress output, etc. -- see comment above). Defaulting
+        // to `_currentFilePath` unconditionally meant a non-PDF export (e.g. an
+        // extracted image) still offered the open document's own name with a
+        // .pdf extension, since _currentFilePath is truthy whenever a PDF is
+        // open and always won the `||`. Only reuse it for an actual PDF export;
+        // otherwise trust the exported file's own name/extension, kept in the
+        // same folder as the open document for convenience.
+        const isPdfExport = file.type === 'application/pdf' || /\.pdf$/i.test(file.name);
+        const dir = _currentFilePath ? _currentFilePath.replace(/[/\\][^/\\]+$/, '') : '';
+        const defaultPath = isPdfExport
+          ? (_currentFilePath || file.name)
+          : (dir ? `${dir}/${file.name}` : file.name);
+        await saveFileBytes(bytes, defaultPath);
       },
     });
     const wrapperShadowRoot = (result as any).ui?.pdfWebElement?.shadowRoot as ShadowRoot | undefined;
