@@ -1640,6 +1640,38 @@ async function handleAddImageToPage(data: {
   }
 }
 
+// ── Engine call retry ────────────────────────────────────────────────────────
+// RDB-7908: createAnnotation/changeAnnotationProperties/createTextBlock/
+// editPageText occasionally throw a transient native
+// `json.exception.type_error.30x` (nlohmann::json) on otherwise-identical,
+// minimal params — confirmed by reproducing the exact same call three times
+// and getting "type must be string, but is {object|null|number}" for the
+// same field each time. Not something our params can be at fault for (we
+// weren't varying object/null/number across those calls), and a bare retry
+// reliably recovers, so treat it as engine flakiness rather than a data bug.
+// Applied at every direct doc/pdfEditor mutation call site rather than only
+// the one that first surfaced it, since nothing about this is specific to
+// widget creation.
+function isTransientEngineError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return /json\.exception\.type_error/.test(msg);
+}
+
+async function withEngineRetry<T>(fn: () => Promise<T>, attempts = 6, baseDelayMs = 200): Promise<T> {
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (i === attempts - 1 || !isTransientEngineError(err)) throw err;
+      // Backoff instead of a fixed delay: 3 quick retries weren't enough to
+      // reliably clear this (RDB-7908 add_form_field still surfaced the error
+      // after 3x250ms), so give the engine progressively more time to settle.
+      await new Promise<void>((r) => setTimeout(r, baseDelayMs * (i + 1)));
+    }
+  }
+  throw new Error('unreachable'); // attempts is always >= 1
+}
+
 type AnnotationCommand = {
   shape: string; page: number; x: number; y: number;
   width: number; height: number; color: string | null; fillColor: string | null; borderWidth: number | null;
@@ -1687,7 +1719,7 @@ async function handleAddAnnotation(data: AnnotationCommand): Promise<void> {
       default:
         params = { T: 'Square', rect: [x1, y1, x2, y2], color, BS: { W: bw } };
     }
-    await (doc as any).createAnnotation({ pageIndex, params });
+    await withEngineRetry(() => (doc as any).createAnnotation({ pageIndex, params }));
     show(`Added ${data.shape} on page ${data.page}`);
     setTimeout(() => { statusEl.style.display = 'none'; }, 3000);
     // See handleRotatePages above: feeds RDB-7843 tracking for the next tool call.
@@ -1749,7 +1781,7 @@ async function handleCircleText(data: {
       const rect = rects[i];
       if (!rect) continue;
       const pageIndex = r?.begin?.pageIndex ?? 0;
-      await (doc as any).createAnnotation({
+      await withEngineRetry(() => (doc as any).createAnnotation({
         pageIndex,
         params: {
           T: annotType,
@@ -1757,7 +1789,7 @@ async function handleCircleText(data: {
           color,
           BS: { W: bw },
         },
-      });
+      }));
       count++;
     }
 
@@ -2094,7 +2126,7 @@ async function handleUpdateAnnotation(data: { page: number; annotIndex: number; 
     if (data.fillColor !== null) properties['IC'] = data.fillColor;
     if (data.opacity !== null) { properties['CA'] = data.opacity; properties['ca'] = data.opacity; }
     if (data.text !== null) properties['c'] = data.text;
-    await pdfEditor.changeAnnotationProperties(docId, { pageIndex, annotIndex: data.annotIndex, properties });
+    await withEngineRetry(() => pdfEditor.changeAnnotationProperties(docId, { pageIndex, annotIndex: data.annotIndex, properties }));
     show(`Updated annotation ${data.annotIndex} on page ${data.page}`);
     setTimeout(() => { statusEl.style.display = 'none'; }, 2000);
     await (app as any).callServerTool({
@@ -3410,14 +3442,14 @@ async function handleSearchAndRedact(data: { text: string; caseSensitive: boolea
       }
       if (!combined) continue;
 
-      await (doc as any).createAnnotation({
+      await withEngineRetry(() => (doc as any).createAnnotation({
         pageIndex,
         params: {
           T: 'Redact',
           rect: [combined.left, combined.bottom, combined.right, combined.top],
           color: '#FFFF0000',
         },
-      });
+      }));
       markedCount++;
     }
 
@@ -3595,15 +3627,15 @@ async function handleAddTextToPage(data: {
     const fontSize = data.font_size ?? 12;
     const font = { S: fontSize, F: 'Helvetica', C: '#FF000000' };
 
-    await (doc as any).createTextBlock({ pageIndex, font, position: [left, pdfTop] });
+    await withEngineRetry(() => (doc as any).createTextBlock({ pageIndex, font, position: [left, pdfTop] }));
 
     if (!page.isLoaded) await (doc as any).loadPageContent(page);
     const newIdx = ((page.textBlocks as unknown[]) ?? []).length - 1;
     if (newIdx >= 0) {
-      await (doc as any).editPageText({
+      await withEngineRetry(() => (doc as any).editPageText({
         pageIndex,
         textblocks: [{ index: newIdx, spans: [{ text: data.text, font }] }],
-      });
+      }));
     }
 
     show(`Text added to page ${data.page}`);
@@ -3672,12 +3704,43 @@ async function handleAddFormField(data: AddFormFieldCommand): Promise<void> {
       params.V = data.default_value;
     }
 
-    if (data.field_type === 'dropdown' || data.field_type === 'listbox') {
-      params.O = data.options ? data.options.map((o) => ({ name: o, value: o })) : {};
+    // Tag which step threw if a retry still doesn't recover (see
+    // withEngineRetry above) — createAnnotation itself, or the follow-up
+    // changeAnnotationProperties — instead of one generic "add_form_field
+    // error" that gives no way to tell which call and payload were involved.
+    let response: any;
+    try {
+      response = await withEngineRetry(() => (doc as any).createAnnotation({ pageIndex, params }));
+    } catch (err) {
+      throw new Error(`createAnnotation(FT=${FT}, params=${JSON.stringify(params)}) failed: ${err instanceof Error ? err.message : String(err)}`);
     }
-
-    const response = await (doc as any).createAnnotation({ pageIndex, params }) as any;
     const fieldName: string | null = response?.F?.N ?? response?.field?.[0]?.N ?? null;
+
+    // The engine always resets O to {} when creating a ComboBox/ListBox widget
+    // (confirmed in the vendor's own widget-creation code), silently
+    // discarding any options passed in createAnnotation's params. The vendor's
+    // own "Items" dialog applies options via a separate changeAnnotationProperties
+    // call after creation, so mirror that here: locate the just-created
+    // annotation's index on the page and patch its options in as a second step.
+    if ((data.field_type === 'dropdown' || data.field_type === 'listbox') && data.options && data.options.length > 0) {
+      // response.annot is a plain content snapshot (IPDFAnnotationContent),
+      // not the live PdfAnnotation instance stored in page.annotations, so
+      // reference equality (indexOf) never matches — match by the stable
+      // numeric `id` both shapes carry instead.
+      const pageAnnotations = ((doc.getPages() as any[])[pageIndex]?.annotations as any[]) ?? [];
+      const targetId = response?.annot?.id;
+      const annotIndex = pageAnnotations.findIndex((a) => (a?.nativeData?.id ?? a?.id) === targetId);
+      if (annotIndex >= 0) {
+        const properties = { field: { O: data.options.map((o) => ({ name: o, value: o })) } };
+        try {
+          await withEngineRetry(() => (doc as any).changeAnnotationProperties(annotIndex, pageIndex, properties, 'Widget'));
+        } catch (err) {
+          throw new Error(`changeAnnotationProperties(annotIndex=${annotIndex}, pageIndex=${pageIndex}, properties=${JSON.stringify(properties)}) failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      } else {
+        throw new Error(`could not locate created annotation on page ${pageIndex} (response.annot=${JSON.stringify(response?.annot)})`);
+      }
+    }
 
     // RDB-7907: passing V in the createAnnotation params above is unreliable
     // for text fields — the engine sometimes creates the field without ever
@@ -3695,15 +3758,15 @@ async function handleAddFormField(data: AddFormFieldCommand): Promise<void> {
       const fieldPdfTop = ph - (data.y / 100) * ph;
       try {
         const labelFont = { S: 11, F: 'Helvetica', C: '#FF000000' };
-        await (doc as any).createTextBlock({ pageIndex, font: labelFont, position: [left, fieldPdfTop] });
+        await withEngineRetry(() => (doc as any).createTextBlock({ pageIndex, font: labelFont, position: [left, fieldPdfTop] }));
         const pageModel = (doc as any).pages?.[pageIndex] ?? pages[pageIndex];
         if (!pageModel.isLoaded) await (doc as any).loadPageContent(pageModel);
         const newIdx = ((pageModel.textBlocks as unknown[]) ?? []).length - 1;
         if (newIdx >= 0) {
-          await (doc as any).editPageText({
+          await withEngineRetry(() => (doc as any).editPageText({
             pageIndex,
             textblocks: [{ index: newIdx, spans: [{ text: data.label, font: labelFont }] }],
-          });
+          }));
         }
       } catch { /* label is optional */ }
     }
