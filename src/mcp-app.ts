@@ -2076,24 +2076,29 @@ async function handleReadAnnotations(data: { page: number | null }): Promise<voi
   try {
     const doc = (activeDocumentView() as any)?.getDocument?.();
     if (!doc) throw new Error('document not available');
-    const docId = (doc as any).id;
-    const pdfEditor = (doc as any).pdfEditor;
-    if (!pdfEditor) throw new Error('pdfEditor not accessible');
     const results: any[] = [];
     const pageCount = (doc.getNumPages?.() ?? 0) as number;
     const startPage = data.page !== null ? data.page - 1 : 0;
     const endPage = data.page !== null ? data.page - 1 : pageCount - 1;
     for (let pi = startPage; pi <= endPage; pi++) {
-      const annots: any[] = await pdfEditor.getPageAnnotations({ documentId: docId, index: pi });
-      (annots ?? []).forEach((ann: any, idx: number) => {
-        const R = ann.R;
+      // RDB-8047: read annotations off the document's own public `annotations`
+      // model (doc.getPage(i).annotations) instead of the vendor SDK's
+      // internal `pdfEditor.getPageAnnotations()` -- (doc as any).pdfEditor
+      // was reaching for a true JS private class field the SDK never exposes
+      // (confirmed against the shipped 0.10.6 bundle and its .d.ts: no
+      // DocumentModel/PageModel property is ever named pdfEditor), so it was
+      // always undefined, not merely slow to attach.
+      const page = (doc as any).getPage?.(pi);
+      const annots: any[] = page?.annotations ?? [];
+      annots.forEach((ann: any, idx: number) => {
+        const rect = ann.rect;
         results.push({
           page: pi + 1,
           index: idx,
-          type: ann.T ?? 'unknown',
-          color: ann.C ?? null,
-          content: ann.c ?? '',
-          rect: Array.isArray(R) ? { left: R[0], top: R[1], right: R[2], bottom: R[3] } : null,
+          type: ann.type ?? 'unknown',
+          color: ann.color ?? null,
+          content: ann.content ?? '',
+          rect: rect ? { left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom } : null,
         });
       });
     }
@@ -2163,15 +2168,21 @@ async function handleUpdateAnnotation(data: { page: number; annotIndex: number; 
     const doc = (activeDocumentView() as any)?.getDocument?.();
     if (!doc) throw new Error('document not available');
     const pageIndex = data.page - 1;
-    const docId = (doc as any).id;
-    const pdfEditor = (doc as any).pdfEditor;
-    if (!pdfEditor) throw new Error('pdfEditor not accessible');
+    // RDB-8047: changeAnnotationProperties is a public method directly on
+    // DocumentModel (data: {pageIndex, annotIndex, properties}, type:
+    // AnnotsTypes) -- it never took a documentId, and never lived on
+    // doc.pdfEditor (see handleReadAnnotations above for why that was always
+    // undefined). The `type` argument is required by the worker to know which
+    // annotation subtype it's patching, read off the existing annotation.
+    const page = (doc as any).getPage?.(pageIndex);
+    const annotation = page?.annotations?.[data.annotIndex];
+    if (!annotation) throw new Error(`annotation ${data.annotIndex} not found on page ${data.page}`);
     const properties: Record<string, unknown> = {};
     if (data.color !== null) properties['C'] = data.color;
     if (data.fillColor !== null) properties['IC'] = data.fillColor;
     if (data.opacity !== null) { properties['CA'] = data.opacity; properties['ca'] = data.opacity; }
     if (data.text !== null) properties['c'] = data.text;
-    await withEngineRetry(() => pdfEditor.changeAnnotationProperties(docId, { pageIndex, annotIndex: data.annotIndex, properties }));
+    await withEngineRetry(() => (doc as any).changeAnnotationProperties({ pageIndex, annotIndex: data.annotIndex, properties }, annotation.type));
     show(`Updated annotation ${data.annotIndex} on page ${data.page}`);
     setTimeout(() => { statusEl.style.display = 'none'; }, 2000);
     await (app as any).callServerTool({
@@ -2930,26 +2941,24 @@ async function tryChangeAcroform(doc: any, field: string, value: string): Promis
 async function collectButtonOnValues(doc: any): Promise<{ map: Map<string, string[]>; debugWidgets: Map<string, unknown[]> }> {
   const map = new Map<string, string[]>();
   const debugWidgets = new Map<string, unknown[]>();
-  const pdfEditor = doc?.pdfEditor;
-  const docId = doc?.id;
-  if (!pdfEditor || docId === undefined) return { map, debugWidgets };
+  if (doc?.getPage === undefined) return { map, debugWidgets };
   const pageCount = (doc.getNumPages?.() ?? 0) as number;
   for (let pi = 0; pi < pageCount; pi++) {
-    let annots: any[] = [];
-    try {
-      annots = await pdfEditor.getPageAnnotations({ documentId: docId, index: pi });
-    } catch {
-      continue;
-    }
-    for (const a of annots ?? []) {
-      if (a?.T !== 'Widget') continue;
-      const field = typeof a.P === 'string' ? a.P : '';
+    // RDB-8047: same public annotations model as handleReadAnnotations --
+    // this used to go through doc.pdfEditor.getPageAnnotations(), which was
+    // always undefined (see the note there).
+    const page = doc.getPage?.(pi);
+    const annots: any[] = page?.annotations ?? [];
+    for (const ann of annots) {
+      const native = (ann as any)?.nativeData ?? {};
+      if (native.T !== 'Widget') continue;
+      const field = typeof native.P === 'string' ? native.P : '';
       if (!field) continue;
-      const v = typeof a.V === 'string' ? a.V : '';
+      const v = typeof native.V === 'string' ? native.V : '';
       if (v === '' || v.toLowerCase() === 'off') {
         let dbg = debugWidgets.get(field);
         if (!dbg) { dbg = []; debugWidgets.set(field, dbg); }
-        dbg.push(a);
+        dbg.push(native);
         continue;
       }
       let list = map.get(field);
