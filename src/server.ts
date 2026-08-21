@@ -168,7 +168,32 @@ const DIAG_HTML_PATH = path.join(__dirname, 'diag.html');
 // MCP-side instance resolves in the widget-side instance in Cowork mode.
 // saveBuffers stays in memory: all chunks of one save_pdf upload arrive at the
 // same instance (the widget's), so they never cross a process boundary.
+//
+// RDB-8046: keyed by a per-export saveId (minted client-side per saveChunked()
+// call), NOT by the long-lived file token. The widget can trigger overlapping
+// exports for the same document (auto-save-on-command, the debounced
+// isModified auto-save, and manual Save/Save As/Export all reuse the same
+// token) -- keying by token let two concurrent exports' chunks land in one
+// shared array, so whichever finished first would Buffer.concat a mix of both
+// payloads into a truncated/corrupt file. saveId gives each export its own
+// buffer list so concurrent exports can never interleave.
 const saveBuffers = new Map<string, Buffer[]>();
+
+// RDB-8046: even with per-export buffers, two complete exports finishing
+// around the same time can still race on the final fs.writeFile to the same
+// path -- Node's default 'w' flag truncates on open, so a second writer's
+// open() can truncate the file out from under a first writer that is still
+// mid-write, corrupting the result. Serialize writes per target path so a
+// second save waits for the first to finish instead of colliding with it.
+const pathWriteQueues = new Map<string, Promise<void>>();
+function serializeWrite(targetPath: string, write: () => Promise<void>): Promise<void> {
+  const prior = pathWriteQueues.get(targetPath) ?? Promise.resolve();
+  const next = prior.then(write, write).finally(() => {
+    if (pathWriteQueues.get(targetPath) === next) pathWriteQueues.delete(targetPath);
+  });
+  pathWriteQueues.set(targetPath, next);
+  return next;
+}
 
 // Appended to edit-tool descriptions so the model doesn't paraphrase away the
 // save-location note docNote() attaches to the response text — observed in
@@ -719,10 +744,11 @@ async function main(): Promise<void> {
         offset: z.coerce.number().int().min(0),
         totalSize: z.coerce.number().int().min(1),
         savePath: z.string().optional().describe('Override save path; defaults to original file path'),
+        saveId: z.string().optional().describe('Unique id for this export, distinguishing it from other concurrent exports of the same document'),
       },
       _meta: { ui: { resourceUri, visibility: ['app'] as const } },
     },
-    async ({ token, chunk, offset, totalSize, savePath }) => {
+    async ({ token, chunk, offset, totalSize, savePath, saveId }) => {
       pruneExpired();
       const entry = shared.getFileToken(token);
       if (!entry) {
@@ -732,14 +758,17 @@ async function main(): Promise<void> {
         };
       }
       const targetPath = savePath?.trim() || entry.fullPath;
-      if (!saveBuffers.has(token)) saveBuffers.set(token, []);
+      // Fall back to token for older widget builds that don't send saveId yet
+      // -- worse (no interleaving protection) but never worse than before.
+      const bufferKey = saveId || token;
+      if (!saveBuffers.has(bufferKey)) saveBuffers.set(bufferKey, []);
       const chunkBuf = Buffer.from(chunk, 'base64');
-      saveBuffers.get(token)!.push(chunkBuf);
+      saveBuffers.get(bufferKey)!.push(chunkBuf);
       const bytesReceived = offset + chunkBuf.length;
       if (bytesReceived >= totalSize) {
-        const full = Buffer.concat(saveBuffers.get(token)!);
-        saveBuffers.delete(token);
-        await fs.writeFile(targetPath, full);
+        const full = Buffer.concat(saveBuffers.get(bufferKey)!);
+        saveBuffers.delete(bufferKey);
+        await serializeWrite(targetPath, () => fs.writeFile(targetPath, full));
         console.error(`[save_pdf] saved ${full.length} bytes -> ${targetPath}`);
         return {
           content: [{ type: 'text', text: JSON.stringify({ done: true, savedPath: targetPath }) }],

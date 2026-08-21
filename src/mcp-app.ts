@@ -1163,6 +1163,11 @@ const COMPRESS_QUALITY: Record<string, number> = {
 
 async function saveChunked(bytes: Uint8Array, targetPath: string, label = 'Saving', silent = false): Promise<void> {
   const totalSize = bytes.length;
+  // RDB-8046: every call gets its own id so the server never mixes this
+  // export's chunks with a concurrent one for the same token (auto-save on
+  // command, the debounced isModified auto-save, and manual Save/Save
+  // As/Export can all fire close together for the same document).
+  const saveId = `${_currentToken}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
   let offset = 0;
   while (offset < totalSize) {
     const chunk = bytes.slice(offset, offset + CHUNK_SIZE);
@@ -1170,7 +1175,7 @@ async function saveChunked(bytes: Uint8Array, targetPath: string, label = 'Savin
     for (let i = 0; i < chunk.length; i += 65536) bin += String.fromCharCode(...chunk.subarray(i, i + 65536));
     await (app as any).callServerTool({
       name: 'save_pdf',
-      arguments: { token: _currentToken, savePath: targetPath, chunk: btoa(bin), offset, totalSize },
+      arguments: { token: _currentToken, savePath: targetPath, chunk: btoa(bin), offset, totalSize, saveId },
     });
     offset += chunk.length;
     if (!silent) showSaveProgress(label, (offset / totalSize) * 100);
@@ -1198,19 +1203,44 @@ function getWorkingFilePath(): string | null {
   return _workingFilePath;
 }
 
+// RDB-8046: the command-success trigger below and the debounced isModified
+// trigger can both fire within moments of each other for the same edit. Two
+// overlapping exports are wasteful even now that the server can no longer
+// mix their bytes together, so coalesce: a call that arrives while one is
+// already running just waits for it and requests one more run afterward
+// (to pick up any edit the in-flight export missed) instead of starting a
+// second export of its own.
+let _autoSaveInFlight: Promise<string | null> | null = null;
+let _autoSaveRerunRequested = false;
+
 async function autoSaveWorkingCopy(): Promise<string | null> {
-  const targetPath = getWorkingFilePath();
-  if (!targetPath) return null;
+  if (_autoSaveInFlight) {
+    _autoSaveRerunRequested = true;
+    return _autoSaveInFlight;
+  }
+  _autoSaveInFlight = (async () => {
+    const targetPath = getWorkingFilePath();
+    if (!targetPath) return null;
+    try {
+      const doc = (activeDocumentView() as any)?.getDocument?.();
+      if (!doc) return null;
+      const raw = await doc.exportDocument({ as: 'uint8array' });
+      const bytes = new Uint8Array(raw instanceof ArrayBuffer ? raw : (raw as ArrayBufferView).buffer);
+      await saveChunked(bytes, targetPath, 'Auto-saving', /* silent */ true);
+      return targetPath;
+    } catch (err) {
+      beacon(`auto-save working copy failed: ${(err as Error).message}`);
+      return null;
+    }
+  })();
   try {
-    const doc = (activeDocumentView() as any)?.getDocument?.();
-    if (!doc) return null;
-    const raw = await doc.exportDocument({ as: 'uint8array' });
-    const bytes = new Uint8Array(raw instanceof ArrayBuffer ? raw : (raw as ArrayBufferView).buffer);
-    await saveChunked(bytes, targetPath, 'Auto-saving', /* silent */ true);
-    return targetPath;
-  } catch (err) {
-    beacon(`auto-save working copy failed: ${(err as Error).message}`);
-    return null;
+    return await _autoSaveInFlight;
+  } finally {
+    _autoSaveInFlight = null;
+    if (_autoSaveRerunRequested) {
+      _autoSaveRerunRequested = false;
+      void autoSaveWorkingCopy();
+    }
   }
 }
 
