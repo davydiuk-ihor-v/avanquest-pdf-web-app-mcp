@@ -2873,10 +2873,19 @@ async function handleReadFormFields(): Promise<void> {
           // caller can pass an exact value or a 1-based index to update_form_field.
           if (onValues.length > 0) {
             entry.options = onValues.slice();
+          } else if (Array.isArray(f.C) && f.C.length > 0) {
+            // RDB-7889: a radio group where no option has ever been selected
+            // has no on-value discoverable via V on any widget (V only
+            // reflects the CURRENT toggle state, so a never-picked option
+            // never appears there) -- but the field's own JSON exposes its
+            // export values directly under "C" regardless of selection
+            // state (IFormField.C in the SDK types). Use that instead of
+            // guessing blind.
+            entry.options = f.C.map((v: unknown) => String(v));
           } else {
-            // RDB-7889: nothing pre-selected, so no on-value was discoverable
-            // via V on any widget — dump the raw widget JSON so the actual
-            // shape is visible instead of failing silently.
+            // RDB-7889: nothing pre-selected, and no "C" export-values list
+            // either — dump the raw widget JSON so the actual shape is
+            // visible instead of failing silently.
             entry._debug_no_options_raw_widgets = debugWidgets.get(f.fieldName) ?? [];
           }
         } else if (onValues.length === 1) {
@@ -3037,7 +3046,13 @@ async function handleUpdateFormField(data: { field_name: string; value: string }
       // on-state(s) from the widget annotations so the correct value is used.
       const norm = data.value.trim().toLowerCase();
       const currentlyChecked = currentValue !== '' && currentValue.toLowerCase() !== 'off';
-      const onValues = await getButtonOnValues(doc, data.field_name);
+      let onValues = await getButtonOnValues(doc, data.field_name);
+      if (onValues.length === 0 && Array.isArray(field.C) && field.C.length > 0) {
+        // RDB-7889: same fallback as read_form_fields (see the comment
+        // there) -- a never-selected radio group has nothing discoverable
+        // via V, but the field's own "C" export-values list still works.
+        onValues = field.C.map((v: unknown) => String(v));
+      }
       const isRadio = field.buttonType === 'radio' || onValues.length > 1;
       if (FALSY_FORM_VALUES.has(norm)) {
         // The viewer unchecks with an empty string; fall back to "Off" if the
