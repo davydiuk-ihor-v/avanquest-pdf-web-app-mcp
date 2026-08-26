@@ -233,6 +233,23 @@ export function getFileToken(token: string): FileEntry | null {
   return entry;
 }
 
+// RDB-8115: a document left open (and polled) for longer than TOKEN_TTL_MS
+// had its file token expire out from under it even with zero real idle time
+// -- save_pdf then failed with "token expired", but the widget never checked
+// that response (see the saveChunked fix), so the user saw "Saved!" for a
+// file that was never written. Fixed on two sides: saveChunked now surfaces
+// the error, and this renews the token while get_viewer_command's ~800ms
+// poller (startViewerCommandPoller) keeps ticking -- i.e. for as long as the
+// document is actually open, not just "recently minted". Only rewrites
+// tokens.json once the token is past its half-life, not on every poll tick.
+export function touchFileToken(token: string): void {
+  const tokens = loadTokens();
+  const entry = tokens[token];
+  if (!entry || entry.expiresAt - Date.now() > TOKEN_TTL_MS / 2) return;
+  entry.expiresAt = Date.now() + TOKEN_TTL_MS;
+  writeJson('tokens.json', tokens);
+}
+
 // ── save_pdf chunk buffers (RDB-7731) ───────────────────────────────────────
 // Chunks of one save_pdf upload used to accumulate in a process-local
 // Map<string, Buffer[]>, on the (false, in Cowork mode) assumption that they
