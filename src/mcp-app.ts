@@ -20,6 +20,9 @@ type ViewerResult = {
 
 const statusEl = document.getElementById('status')!;
 const viewerEl = document.getElementById('viewer')!;
+// RDB-8038: covers the vendor's own brief "no document open" home screen
+// while the first PdfEditor() mount is still loading -- see initEditor().
+const viewerMaskEl = document.getElementById('viewer-mask')!;
 const { base, license, proxy } = window.PWV_CONFIG;
 
 // Mirrors every boot stage / error to the asset server, which prints it to
@@ -1068,8 +1071,10 @@ function initEditor(initialFile?: File): Promise<ViewerResult> {
     if (initial) applyDefaultViewSettings(initial);
 
     statusEl.style.display = 'none';
+    viewerMaskEl.style.display = 'none';
     return result;
   })().catch((err: unknown) => {
+    viewerMaskEl.style.display = 'none';
     show(`init failed: ${(err as Error).message}\n${(err as Error).stack ?? ''}`, true);
     // Clear the server-side _pendingDocOpen gate even on failure. Without
     // this, a genuinely failed/stuck editor init (bad license, WASM load
