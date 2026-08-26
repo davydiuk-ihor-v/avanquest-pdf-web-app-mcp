@@ -2882,6 +2882,12 @@ async function main(): Promise<void> {
       if (!token || (latest?.token && latest.token !== token)) {
         return { content: [{ type: 'text' as const, text: JSON.stringify({ command: null }) }] };
       }
+      // RDB-8115: this poll (~800ms while the document stays open, see
+      // startViewerCommandPoller) is the one thing that reliably keeps
+      // firing regardless of user idle time -- piggyback the file token's
+      // renewal on it so a document left open for longer than TOKEN_TTL_MS
+      // doesn't have save_pdf start failing with "token expired".
+      shared.touchFileToken(token);
       const cmd = shared.takeViewerCommand();
       return {
         content: [{ type: 'text' as const, text: JSON.stringify({ command: cmd }) }],

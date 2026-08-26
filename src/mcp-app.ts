@@ -1194,10 +1194,17 @@ async function saveChunked(bytes: Uint8Array, targetPath: string, label = 'Savin
     const chunk = bytes.slice(offset, offset + CHUNK_SIZE);
     let bin = '';
     for (let i = 0; i < chunk.length; i += 65536) bin += String.fromCharCode(...chunk.subarray(i, i + 65536));
-    await (app as any).callServerTool({
+    const result = await (app as any).callServerTool({
       name: 'save_pdf',
       arguments: { token: _currentToken, savePath: targetPath, chunk: btoa(bin), offset, totalSize, saveId },
     });
+    // RDB-8115: an MCP tool error comes back as a normal resolved result
+    // (isError: true / an `error` field in the JSON body), not a rejected
+    // promise -- this await alone never caught save_pdf failing (e.g. an
+    // expired file token), so every caller's try/catch never fired and
+    // saveFileBytes went straight to "PDF saved successfully" regardless.
+    const data = JSON.parse((result.content[0] as { text: string }).text) as { error?: string };
+    if (data.error) throw new Error(data.error);
     offset += chunk.length;
     if (!silent) showSaveProgress(label, (offset / totalSize) * 100);
   }
