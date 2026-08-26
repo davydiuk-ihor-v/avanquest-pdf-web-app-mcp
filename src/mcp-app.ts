@@ -945,10 +945,24 @@ let editorReady: Promise<ViewerResult> | null = null;
 const ZOOM_FIX_WINDOW_MS = 15_000;
 let _zoomFixObserver: ResizeObserver | null = null;
 
+// RDB-8130: the vendor's own document-open handling reads the PDF's embedded
+// /PageLayout viewer preference (Catalog entry) and, if present, re-applies
+// it via setLayout() one tick after open (a deferred setTimeout(...,0) in its
+// document-viewer-wrapper) -- silently overriding our own setLayout below.
+// PDFs saved with /PageLayout /SinglePage (common alongside bookmarks/
+// outlines from some authoring tools) land back in single-page/no-scroll
+// mode this way. Guard against that for a short window right after open,
+// the same pattern as the zoom-fit race above; stop once it's passed so a
+// later, genuine user choice to switch to single-page isn't fought.
+const LAYOUT_FIX_WINDOW_MS = 5_000;
+const LAYOUT_FIX_POLL_MS = 200;
+let _layoutFixInterval: ReturnType<typeof setInterval> | null = null;
+
 function applyDefaultViewSettings(docVm: any): void {
-  // A new document replaces whichever one the previous observer was
-  // guarding — stop it so it doesn't keep correcting a stale docVm.
+  // A new document replaces whichever one the previous observer/subscription
+  // was guarding — stop them so they don't keep correcting a stale docVm.
   _zoomFixObserver?.disconnect();
+  if (_layoutFixInterval) clearInterval(_layoutFixInterval);
   watchDocumentModifications(docVm);
 
   // setLayout first: switching layout mode can reset the page-view fit mode
@@ -962,6 +976,25 @@ function applyDefaultViewSettings(docVm: any): void {
   // be redesigned, so scrolling must be enabled by default. Set explicitly
   // rather than relying on the vendor default so this survives vendor bumps.
   try { docVm?.setLayout?.('continuous'); } catch (_) { /* non-fatal */ }
+
+  // RDB-8130 diagnostic confirmed the vendor's own re-application of the
+  // PDF's /PageLayout viewer preference does NOT go through setLayout() in a
+  // way that emits layoutChanged() -- a subscription to that observable
+  // never fired even though getLayout() had reverted to 'single' a few
+  // seconds later. Poll getLayout() instead and force it back for a short
+  // window after open; stop once the window passes so a later, genuine user
+  // choice to switch to single-page isn't fought.
+  const layoutDeadline = Date.now() + LAYOUT_FIX_WINDOW_MS;
+  _layoutFixInterval = setInterval(() => {
+    if (Date.now() > layoutDeadline) {
+      if (_layoutFixInterval) clearInterval(_layoutFixInterval);
+      _layoutFixInterval = null;
+      return;
+    }
+    try {
+      if (docVm?.getLayout?.() !== 'continuous') docVm?.setLayout?.('continuous');
+    } catch (_) { /* non-fatal */ }
+  }, LAYOUT_FIX_POLL_MS);
   // actualSize tells the viewer to honor our explicit zoom instead of
   // auto-fitting, otherwise setZoom() below is silently ignored.
   const forceActualSizeZoom = () => {
