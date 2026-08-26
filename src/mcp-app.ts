@@ -596,6 +596,17 @@ let _openingDocument: Promise<void> | null = null;
 function activeDocumentView(): any {
   return _pdfWebService?.getActiveDocumentViewElement?.()?.documentView ?? null;
 }
+
+// RDB-8056: this host (Claude Desktop) runs on both Windows and macOS, and
+// _currentFilePath reflects whatever OS opened the document ('\'-delimited
+// on Windows, '/' on macOS/Linux) -- joining with a hardcoded separator
+// produces a mixed-separator path on whichever platform doesn't match it.
+// Infer the separator from `dir` itself instead of assuming one.
+function joinDirAndName(dir: string, name: string): string {
+  if (!dir) return name;
+  const sep = dir.includes('\\') ? '\\' : '/';
+  return `${dir}${sep}${name}`;
+}
 let _pdfWebService: any = null;
 // RDB-7824: headless document loader (result.sdk.openDocument) for opening an
 // OCR result File without touching the visible viewer/tabs -- see handleReadText.
@@ -1049,7 +1060,7 @@ function initEditor(initialFile?: File): Promise<ViewerResult> {
         const dir = _currentFilePath ? _currentFilePath.replace(/[/\\][^/\\]+$/, '') : '';
         const defaultPath = isPdfExport
           ? (_currentFilePath || file.name)
-          : (dir ? `${dir}/${file.name}` : file.name);
+          : joinDirAndName(dir, file.name);
         await saveFileBytes(bytes, defaultPath);
       },
     });
@@ -3531,7 +3542,7 @@ async function handleSaveAs(data: { outputPath: string | null; fileName: string 
     if (!targetPath) {
       const dir = _currentFilePath ? _currentFilePath.replace(/[/\\][^/\\]+$/, '') : '';
       const name = data.fileName || 'document_copy.pdf';
-      targetPath = dir ? `${dir}\\${name}` : name;
+      targetPath = joinDirAndName(dir, name);
     }
     await saveChunked(bytes, targetPath, 'Saving copy');
     _currentFilePath = targetPath;
