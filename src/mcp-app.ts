@@ -594,6 +594,9 @@ function activeDocumentView(): any {
   return _pdfWebService?.getActiveDocumentViewElement?.()?.documentView ?? null;
 }
 let _pdfWebService: any = null;
+// RDB-7824: headless document loader (result.sdk.openDocument) for opening an
+// OCR result File without touching the visible viewer/tabs -- see handleReadText.
+let _pdfSdk: any = null;
 
 // Resolved by the global documentOpened$ subscription when a new document finishes loading.
 let _resolveDocOpen: (() => void) | null = null;
@@ -1051,6 +1054,7 @@ function initEditor(initialFile?: File): Promise<ViewerResult> {
     if (wrapperShadowRoot) ensureTopBarGap(wrapperShadowRoot);
     const svc = (result as any).ui?.pdfWebService;
     _pdfWebService = svc;
+    _pdfSdk = (result as any).sdk;
     // documentOpened$ fires when a document is fully loaded — single authoritative subscription.
     // Handles all subsequent display_pdf calls; the first open is handled separately below.
     svc?.documentOpened$?.subscribe?.((docVm: any) => {
@@ -1114,6 +1118,7 @@ async function openPdf(token: string, name: string, filePath?: string): Promise<
   const editor = await editorReady;
   const svc = (editor as any).ui?.pdfWebService;
   _pdfWebService = svc;
+  _pdfSdk = (editor as any).sdk;
 
   // RDB-7811: openDocument()/openFile() previously raced against a fixed
   // timeout and, on timeout, fell through silently to whatever document was
@@ -1332,7 +1337,7 @@ function startViewerCommandPoller(): void {
       } else if (command.type === 'delete_annotation') {
         await handleDeleteAnnotation({ page: command.page as number, annotIndex: command.annotIndex as number });
       } else if (command.type === 'read_text') {
-        await handleReadText();
+        await handleReadText({ pages: command.pages as number[] | null });
       } else if (command.type === 'get_page_image') {
         await handleGetPageImage({ page: command.page as number, zoom: command.zoom as number });
       } else if (command.type === 'update_annotation') {
@@ -2144,12 +2149,128 @@ async function handleGetPageImage(data: { page: number; zoom: number }): Promise
   }
 }
 
-async function handleReadText(): Promise<void> {
+// RDB-7824: reads one page's text via the same PageText mechanism regardless
+// of whether `doc` is the live viewer document or a headless document opened
+// just to read back an OCR result (see handleReadText) -- both expose the
+// same getPages()/loadPageContent()/getPageText() surface.
+async function getPageTextString(doc: any, pageIndex: number): Promise<string> {
+  const pageModel = (doc.getPages() as any[])[pageIndex];
+  if (!pageModel.isLoaded) await doc.loadPageContent(pageModel);
+  const pt = pageModel.getPageText();
+  const numChars = pt.getNumChars();
+  let text = '';
+  for (let i = 0; i < numChars; i++) text += pt.getCharUnicode(i);
+  return text;
+}
+
+// RDB-7824: online-tool commands (document.ocr/convert/translate) take a
+// caller-supplied IApiOperationClient -- the SDK ships no default
+// implementation, integrators are expected to provide their own. The actual
+// HTTP work can't happen here though: this iframe's sandbox CSP blocks
+// fetch() to arbitrary origins (see beacon()'s comment near the top of this
+// file -- it can't even fetch() its own local server). So this client
+// forwards the SDK-built formData to the MCP server (ocr_upload_chunk +
+// ocr_run, server.ts), which does the real start/poll/download against
+// https://developers.avanquest.com/api-reference/getting-started, and reads
+// the result back the same way display_pdf's web-mode fallback already does
+// (fileFromToken).
+function createApiOperationClient() {
+  return {
+    async execute(_endpoints: { start: string }, formData: FormData) {
+      const file = formData.get('file') as File;
+      const pages = formData.get('pages') as string | null;
+      const password = formData.get('password') as string | null;
+      const language = formData.get('language') as string | null;
+      const deskew = formData.get('deskew') as string | null;
+
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      const totalSize = bytes.length;
+      const ocrId = `ocr:${Date.now()}:${Math.random().toString(36).slice(2)}`;
+      let offset = 0;
+      while (offset < totalSize) {
+        const chunk = bytes.slice(offset, offset + CHUNK_SIZE);
+        let bin = '';
+        for (let i = 0; i < chunk.length; i += 65536) bin += String.fromCharCode(...chunk.subarray(i, i + 65536));
+        await (app as any).callServerTool({
+          name: 'ocr_upload_chunk',
+          arguments: { ocrId, chunk: btoa(bin), offset, totalSize },
+        });
+        offset += chunk.length;
+      }
+
+      const runRes = await (app as any).callServerTool({
+        name: 'ocr_run',
+        arguments: {
+          ocrId, totalSize,
+          pages: pages ?? undefined,
+          password: password ?? undefined,
+          language: language ?? undefined,
+          deskew: deskew === 'true',
+        },
+      });
+      const runData = JSON.parse(runRes.content[0].text) as { token?: string; error?: string };
+      if (runData.error) return { finalStatus: { status: 'failed', error: { message: runData.error } } };
+
+      const resultFile = await fileFromToken(runData.token!, 'ocr-result.pdf');
+      const ab = await resultFile.arrayBuffer();
+      return {
+        finalStatus: { status: 'completed' },
+        download: { ab, filename: 'ocr-result.pdf', contentType: 'application/pdf' },
+      };
+    },
+  };
+}
+
+async function handleReadText(data: { pages: number[] | null }): Promise<void> {
   try {
     const doc = (activeDocumentView() as any)?.getDocument?.();
     if (!doc) throw new Error('document not available');
-    const file: File = await (doc as any).convertToText();
-    const text = await file.text();
+    const numPages = (doc.getPages() as unknown[]).length;
+    const pageIndices = data.pages && data.pages.length > 0
+      ? data.pages.map((p) => p - 1).filter((i) => i >= 0 && i < numPages)
+      : Array.from({ length: numPages }, (_, i) => i);
+
+    const pageText = new Map<number, { text: string; ocr: boolean }>();
+    const noTextPages: number[] = [];
+    for (const idx of pageIndices) {
+      const text = await getPageTextString(doc, idx);
+      if (text.length === 0) noTextPages.push(idx);
+      else pageText.set(idx, { text, ocr: false });
+    }
+
+    if (noTextPages.length > 0) {
+      let ocrResult: any;
+      try {
+        ocrResult = await (doc as any).ocr({
+          pages: noTextPages,
+          deskew: true,
+          client: createApiOperationClient(),
+          callback: () => {},
+          abortSignal: new AbortController().signal,
+        });
+      } catch (err) {
+        throw new Error(`OCR failed for page(s) ${noTextPages.map((i) => i + 1).join(', ')}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      // Headless: reads the OCR result's text without touching the visible
+      // viewer/tabs. ocrResult.file's pages correspond 1:1, in order, to the
+      // noTextPages indices we requested (per document.ocr()'s own page
+      // subset extraction), so map back by position.
+      const ocrDoc = await _pdfSdk.openDocument({ file: ocrResult.file, readOnly: true });
+      for (let i = 0; i < noTextPages.length; i++) {
+        const ocrText = await getPageTextString(ocrDoc, i);
+        pageText.set(noTextPages[i], { text: ocrText, ocr: true });
+      }
+    }
+
+    const PAGE_SEPARATOR = '------------------------------';
+    const text = pageIndices
+      .map((idx) => {
+        const entry = pageText.get(idx);
+        if (!entry) return '';
+        return entry.ocr ? `[OCR] ${entry.text}` : entry.text;
+      })
+      .join(`\n${PAGE_SEPARATOR}\n`);
+
     await (app as any).callServerTool({
       name: 'report_viewer_result',
       arguments: { type: 'read_text', json: JSON.stringify({ text }) },

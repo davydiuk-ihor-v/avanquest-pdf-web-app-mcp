@@ -793,6 +793,146 @@ async function main(): Promise<void> {
     },
   );
 
+  // RDB-7824: the widget iframe's sandbox CSP blocks fetch() to arbitrary
+  // origins (see mcp-app.ts's beacon() comment -- it can't even fetch() its
+  // own local server, only this server's own process can make outbound
+  // network calls). So the OCR round trip to Avanquest's online API has to
+  // happen HERE, not in the widget: the widget uploads the extracted PDF in
+  // chunks (mirroring save_pdf's disk-backed buffer from RDB-7731, reusing
+  // the same shared-state.ts helpers), this server does the actual
+  // start/poll/download against the documented public contract
+  // (developers.avanquest.com/api-reference/getting-started), and hands the
+  // result back to the widget as a file token (the same mechanism
+  // read_pdf_bytes_by_token/fileFromToken already use).
+  const OCR_API_TOOLS_URL = 'https://api-developers.avanquest.com';
+
+  registerAppTool(
+    server,
+    'ocr_upload_chunk',
+    {
+      title: 'OCR Upload Chunk',
+      annotations: { readOnlyHint: false, destructiveHint: false },
+      description: 'Internal: upload one chunk of a PDF to be OCR\'d.',
+      inputSchema: {
+        ocrId: z.string(),
+        chunk: z.string().describe('base64-encoded bytes'),
+        offset: z.coerce.number().int().min(0),
+        totalSize: z.coerce.number().int().min(1),
+      },
+      _meta: { ui: { resourceUri, visibility: ['app'] as const } },
+    },
+    async ({ ocrId, chunk, offset, totalSize }) => {
+      await shared.writeSaveChunk(ocrId, offset, Buffer.from(chunk, 'base64'));
+      const persistedSize = await shared.getSaveBufferSize(ocrId);
+      return {
+        content: [{ type: 'text', text: JSON.stringify({ done: persistedSize >= totalSize }) }],
+      };
+    },
+  );
+
+  registerAppTool(
+    server,
+    'ocr_run',
+    {
+      title: 'OCR Run',
+      annotations: { readOnlyHint: false, destructiveHint: false },
+      description: 'Internal: run OCR (via the Avanquest online API) on a PDF already uploaded via ocr_upload_chunk, and return a file token for the result.',
+      inputSchema: {
+        ocrId: z.string(),
+        totalSize: z.coerce.number().int().min(1),
+        pages: z.string().optional().describe('Comma-separated 1-based page numbers, as built by the SDK\'s own buildFormData'),
+        password: z.string().optional(),
+        language: z.string().optional(),
+        deskew: zBool,
+      },
+      _meta: { ui: { resourceUri, visibility: ['app'] as const } },
+    },
+    async ({ ocrId, totalSize, pages, password, language, deskew }) => {
+      try {
+        const persistedSize = await shared.getSaveBufferSize(ocrId);
+        if (persistedSize < totalSize) {
+          return {
+            content: [{ type: 'text', text: JSON.stringify({ error: `incomplete upload: only ${persistedSize} of ${totalSize} bytes were received` }) }],
+            isError: true,
+          };
+        }
+        const fileBytes = await fs.readFile(shared.getSaveBufferPath(ocrId));
+        await shared.removeSaveBuffer(ocrId);
+
+        const formData = new FormData();
+        formData.append('file', new Blob([fileBytes], { type: 'application/pdf' }), 'document.pdf');
+        if (pages) formData.append('pages', pages);
+        if (password) formData.append('password', password);
+        if (language) formData.append('language', language);
+        formData.append('deskew', deskew ? 'true' : 'false');
+
+        const startRes = await fetch(`${OCR_API_TOOLS_URL}/ocr/v1`, {
+          method: 'POST',
+          headers: { 'X-API-KEY': LICENSE_KEY },
+          body: formData,
+        });
+        if (startRes.status !== 202) {
+          const bodyText = await startRes.text().catch(() => '');
+          return {
+            content: [{ type: 'text', text: JSON.stringify({ error: `OCR start failed: HTTP ${startRes.status} ${bodyText}` }) }],
+            isError: true,
+          };
+        }
+        const { id } = (await startRes.json()) as { id: string };
+
+        // Stay comfortably under read_text's 120s outer timeout, which also
+        // has to cover the upload/download steps around this poll loop.
+        const deadline = Date.now() + 95_000;
+        let status = 'pending';
+        let statusError: { message?: string } | undefined;
+        while (Date.now() < deadline) {
+          const statusRes = await fetch(`${OCR_API_TOOLS_URL}/operation/v1/${id}/status`, {
+            headers: { 'X-API-KEY': LICENSE_KEY },
+          });
+          if (!statusRes.ok) {
+            return {
+              content: [{ type: 'text', text: JSON.stringify({ error: `OCR status check failed: HTTP ${statusRes.status}` }) }],
+              isError: true,
+            };
+          }
+          const s = (await statusRes.json()) as { status: string; progress?: number; error?: { message?: string } };
+          status = s.status;
+          if (status === 'completed') break;
+          if (status === 'failed') { statusError = s.error; break; }
+          await new Promise<void>((r) => setTimeout(r, 1000));
+        }
+        if (status !== 'completed') {
+          const reason = statusError?.message ?? (status === 'failed' ? 'unknown error' : `timed out (last status: ${status})`);
+          return {
+            content: [{ type: 'text', text: JSON.stringify({ error: `OCR failed: ${reason}` }) }],
+            isError: true,
+          };
+        }
+
+        const downloadRes = await fetch(`${OCR_API_TOOLS_URL}/operation/v1/${id}/download`, {
+          headers: { 'X-API-KEY': LICENSE_KEY },
+        });
+        if (!downloadRes.ok) {
+          return {
+            content: [{ type: 'text', text: JSON.stringify({ error: `OCR download failed: HTTP ${downloadRes.status}` }) }],
+            isError: true,
+          };
+        }
+        const ab = await downloadRes.arrayBuffer();
+        const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'avanquest-ocr-'));
+        const tmpPath = path.join(tmpDir, 'ocr-result.pdf');
+        await fs.writeFile(tmpPath, Buffer.from(ab));
+        const token = shared.mintToken(tmpPath, 'ocr-result.pdf', true);
+        return { content: [{ type: 'text', text: JSON.stringify({ token }) }] };
+      } catch (err) {
+        return {
+          content: [{ type: 'text', text: JSON.stringify({ error: err instanceof Error ? err.message : String(err) }) }],
+          isError: true,
+        };
+      }
+    },
+  );
+
   // Called by the iframe in web contexts (Cowork / claude.ai) where dynamic
   // import('http://...') is blocked as mixed content. Returns the PDF as base64.
   registerAppTool(
@@ -1674,13 +1814,21 @@ async function main(): Promise<void> {
     {
       title: 'Read Text',
       annotations: { readOnlyHint: true },
-      description: 'Extract all text content from the currently open PDF document as a plain string.',
+      description: 'Extract all text content from the currently open PDF document as a plain string. Pages with no extractable text layer (scanned/image-only pages) are automatically OCR\'d -- their text in the result is prefixed with "[OCR]" since recognition accuracy is lower than a real text layer. OCR requires network access to the Avanquest online API and can take significantly longer than plain extraction.',
+      inputSchema: {
+        pages: z.array(z.coerce.number().int().min(1)).optional().describe('1-based page numbers to read. Omit to read the whole document.'),
+      },
     },
-    async () =>
+    async ({ pages }) =>
+      // RDB-7824: OCR of scanned pages is an async upload/poll/download round
+      // trip to Avanquest's online API (see mcp-app.ts's createApiOperationClient)
+      // -- can genuinely take well over the old 30s ceiling, which is what
+      // produced the generic "make sure a PDF is open" timeout this ticket
+      // reported instead of a real result or a descriptive OCR error.
       pollViewerResult<{ text?: string; error?: string }>(
-        { type: 'read_text' },
+        { type: 'read_text', pages: pages ?? null },
         'read_text',
-        30_000,
+        120_000,
         (d) => {
           if (d.error) return nok(`Error: ${d.error}`);
           return ok(d.text ?? '');
