@@ -1469,6 +1469,7 @@ function startViewerCommandPoller(): void {
           options: command.options as string[] | null,
           bg_color: command.bg_color as string | null,
           border_color: command.border_color as string | null,
+          field_name: command.field_name as string | null,
         });
       } else if (command.type === 'circle_text') {
         await handleCircleText({
@@ -3731,6 +3732,7 @@ type AddFormFieldCommand = {
   x: number; y: number; width: number; height: number;
   default_value: string | null; options: string[] | null;
   bg_color: string | null; border_color: string | null;
+  field_name: string | null;
 };
 
 async function handleAddFormField(data: AddFormFieldCommand): Promise<void> {
@@ -3749,7 +3751,23 @@ async function handleAddFormField(data: AddFormFieldCommand): Promise<void> {
     const left   = (data.x / 100) * pw;
     const right  = ((data.x + data.width) / 100) * pw;
     const pdfTop    = ph - (data.y / 100) * ph;
-    const pdfBottom = ph - ((data.y + data.height) / 100) * ph;
+    let pdfBottom   = ph - ((data.y + data.height) / 100) * ph;
+
+    // RDB-8051: a listbox sized well beyond its option count renders as a
+    // mostly-empty box (the caller/model's height % isn't tied to how many
+    // options it asked for). A description hint isn't enforcement -- clamp
+    // the box height here so it actually reflects the number of options.
+    // Only ever shrinks a too-generous box; never grows one, since growing
+    // risks overlapping unrelated content lower on the page.
+    if (data.field_type === 'listbox' && data.options && data.options.length > 0) {
+      const ROW_HEIGHT_PT = 14;
+      const PADDING_PT = 4;
+      const desiredHeightPt = data.options.length * ROW_HEIGHT_PT + PADDING_PT;
+      const requestedHeightPt = pdfTop - pdfBottom;
+      if (requestedHeightPt > desiredHeightPt) {
+        pdfBottom = pdfTop - desiredHeightPt;
+      }
+    }
 
     const ftMap: Record<string, string> = {
       text: 'TextBox', checkbox: 'CheckBox', radio: 'RadioButton',
@@ -3757,15 +3775,37 @@ async function handleAddFormField(data: AddFormFieldCommand): Promise<void> {
     };
     const FT = ftMap[data.field_type] ?? 'TextBox';
 
+    // RDB-7907: ICreateAnnotationParams doesn't declare N in the SDK's own
+    // .d.ts, but the type already has several loosely-typed pass-through
+    // fields (R/O typed `unknown`) -- passing N anyway costs nothing and
+    // tells us definitively whether the engine's worker protocol honors it
+    // regardless of what the public type declares.
+    const requestedName = data.field_name?.trim() || null;
+    if (requestedName) {
+      const existingNames = ((doc.acroforms ?? []) as any[]).map((f) => f.fieldName).filter(Boolean);
+      if (existingNames.includes(requestedName)) {
+        throw new Error(`field name "${requestedName}" is already used by another field in this document. Existing fields: ${existingNames.join(', ')}`);
+      }
+    }
+
+    // RDB-8051: without an explicit font size, the engine renders the
+    // field's own value/options far too large for the box (looks auto-fit to
+    // the widget height). checkbox/radio/button don't display readable text
+    // (glyph or CA caption instead), so only the text-bearing types need it.
+    const FIELD_FONT_SIZE = 10;
+    const FIELD_TEXT_TYPES = new Set(['text', 'dropdown', 'listbox']);
+
     const params: Record<string, unknown> = {
       T: 'Widget',
       FT,
       R: [left, pdfBottom, right, pdfTop],
     };
+    if (requestedName) params.N = requestedName;
     // CA (Caption) only works for PushButton; for other types we add a FreeText label separately
     if (data.field_type === 'button' && data.label != null) params.CA = data.label;
     if (data.bg_color != null) params.BG = data.bg_color;
     if (data.border_color != null) params.BC = data.border_color;
+    if (FIELD_TEXT_TYPES.has(data.field_type)) params.Fnt = { S: FIELD_FONT_SIZE, F: 'Helvetica' };
 
     if (data.field_type === 'checkbox') {
       params.V = data.default_value === 'Yes' ? 'Yes' : 'Off';
@@ -3785,30 +3825,66 @@ async function handleAddFormField(data: AddFormFieldCommand): Promise<void> {
     }
     const fieldName: string | null = response?.F?.N ?? response?.field?.[0]?.N ?? null;
 
+    // response.annot is a plain content snapshot (IPDFAnnotationContent), not
+    // the live PdfAnnotation instance stored in page.annotations, so reference
+    // equality (indexOf) never matches — match by the stable numeric `id`
+    // both shapes carry instead. Shared by the options patch and the font
+    // reinforcement below, both of which need the same just-created index.
+    const findCreatedAnnotIndex = (): number => {
+      const pageAnnotations = ((doc.getPages() as any[])[pageIndex]?.annotations as any[]) ?? [];
+      const targetId = response?.annot?.id;
+      return pageAnnotations.findIndex((a) => (a?.nativeData?.id ?? a?.id) === targetId);
+    };
+
     // The engine always resets O to {} when creating a ComboBox/ListBox widget
     // (confirmed in the vendor's own widget-creation code), silently
     // discarding any options passed in createAnnotation's params. The vendor's
     // own "Items" dialog applies options via a separate changeAnnotationProperties
     // call after creation, so mirror that here: locate the just-created
     // annotation's index on the page and patch its options in as a second step.
-    if ((data.field_type === 'dropdown' || data.field_type === 'listbox') && data.options && data.options.length > 0) {
-      // response.annot is a plain content snapshot (IPDFAnnotationContent),
-      // not the live PdfAnnotation instance stored in page.annotations, so
-      // reference equality (indexOf) never matches — match by the stable
-      // numeric `id` both shapes carry instead.
-      const pageAnnotations = ((doc.getPages() as any[])[pageIndex]?.annotations as any[]) ?? [];
-      const targetId = response?.annot?.id;
-      const annotIndex = pageAnnotations.findIndex((a) => (a?.nativeData?.id ?? a?.id) === targetId);
-      if (annotIndex >= 0) {
-        const properties = { field: { O: data.options.map((o) => ({ name: o, value: o })) } };
-        try {
-          await withEngineRetry(() => (doc as any).changeAnnotationProperties(annotIndex, pageIndex, properties, 'Widget'));
-        } catch (err) {
-          throw new Error(`changeAnnotationProperties(annotIndex=${annotIndex}, pageIndex=${pageIndex}, properties=${JSON.stringify(properties)}) failed: ${err instanceof Error ? err.message : String(err)}`);
+    // RDB-8051: Fnt is patched separately from O below -- bundling both into
+    // one changeAnnotationProperties call corrupted O in testing (the engine
+    // returned garbage bytes in field.O instead of the requested strings).
+    if (data.field_type === 'dropdown' || data.field_type === 'listbox') {
+      const hasOptions = !!data.options && data.options.length > 0;
+      if (hasOptions) {
+        const annotIndex = findCreatedAnnotIndex();
+        if (annotIndex >= 0) {
+          const optionsProperties = { field: { O: data.options!.map((o) => ({ name: o, value: o })) } };
+          try {
+            await withEngineRetry(() => (doc as any).changeAnnotationProperties(annotIndex, pageIndex, optionsProperties, 'Widget'));
+          } catch (err) {
+            throw new Error(`changeAnnotationProperties(annotIndex=${annotIndex}, pageIndex=${pageIndex}, properties=${JSON.stringify(optionsProperties)}) failed: ${err instanceof Error ? err.message : String(err)}`);
+          }
+          // Font reinforcement is cosmetic -- keep it best-effort so a font
+          // hiccup never costs the (working, load-bearing) options patch.
+          try {
+            await withEngineRetry(() => (doc as any).changeAnnotationProperties(annotIndex, pageIndex, { Fnt: { S: FIELD_FONT_SIZE, F: 'Helvetica' } }, 'Widget'));
+          } catch { /* font reinforcement is best-effort */ }
+        } else {
+          throw new Error(`could not locate created annotation on page ${pageIndex} (response.annot=${JSON.stringify(response?.annot)})`);
         }
       } else {
-        throw new Error(`could not locate created annotation on page ${pageIndex} (response.annot=${JSON.stringify(response?.annot)})`);
+        // No options to apply -- font reinforcement alone is cosmetic, so
+        // don't fail the whole call if the annotation can't be located.
+        try {
+          const annotIndex = findCreatedAnnotIndex();
+          if (annotIndex >= 0) {
+            await withEngineRetry(() => (doc as any).changeAnnotationProperties(annotIndex, pageIndex, { Fnt: { S: FIELD_FONT_SIZE, F: 'Helvetica' } }, 'Widget'));
+          }
+        } catch { /* font reinforcement is best-effort */ }
       }
+    } else if (data.field_type === 'text') {
+      // RDB-8051: same font-size reinforcement as above, for the one other
+      // text-bearing type. Best-effort: a missed patch just leaves the
+      // (already-attempted) createAnnotation Fnt param as the only source of
+      // truth, same as before this fix existed.
+      try {
+        const annotIndex = findCreatedAnnotIndex();
+        if (annotIndex >= 0) {
+          await withEngineRetry(() => (doc as any).changeAnnotationProperties(annotIndex, pageIndex, { Fnt: { S: FIELD_FONT_SIZE, F: 'Helvetica' } }, 'Widget'));
+        }
+      } catch { /* font reinforcement is best-effort */ }
     }
 
     // RDB-7907: passing V in the createAnnotation params above is unreliable
@@ -3823,11 +3899,19 @@ async function handleAddFormField(data: AddFormFieldCommand): Promise<void> {
     }
 
     // For non-button types, add a plain text label above the field via createTextBlock.
+    // RDB-8051: createTextBlock's position is the block's TOP-left corner (text
+    // grows downward from it -- confirmed by handleAddTextToPage using the same
+    // convention). The label used to be placed at exactly pdfTop, the field
+    // rect's own top edge, so it rendered growing straight down INTO the field
+    // instead of sitting above it. Push it up by one line height plus a small
+    // gap so it clears the field instead of overlapping it.
     if (data.label != null && data.field_type !== 'button') {
-      const fieldPdfTop = ph - (data.y / 100) * ph;
+      const LABEL_FONT_SIZE = 9;
+      const LABEL_GAP_PT = 3;
+      const labelPdfTop = Math.min(ph - 1, pdfTop + LABEL_FONT_SIZE * 1.2 + LABEL_GAP_PT);
       try {
-        const labelFont = { S: 11, F: 'Helvetica', C: '#FF000000' };
-        await withEngineRetry(() => (doc as any).createTextBlock({ pageIndex, font: labelFont, position: [left, fieldPdfTop] }));
+        const labelFont = { S: LABEL_FONT_SIZE, F: 'Helvetica', C: '#FF000000' };
+        await withEngineRetry(() => (doc as any).createTextBlock({ pageIndex, font: labelFont, position: [left, labelPdfTop] }));
         const pageModel = (doc as any).pages?.[pageIndex] ?? pages[pageIndex];
         if (!pageModel.isLoaded) await (doc as any).loadPageContent(pageModel);
         const newIdx = ((pageModel.textBlocks as unknown[]) ?? []).length - 1;

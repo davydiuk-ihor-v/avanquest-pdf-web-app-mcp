@@ -22,13 +22,14 @@
 // sessions share one channel, so two documents being edited simultaneously can
 // interleave commands. Timestamps + TTLs below keep a crashed session's
 // leftover files from being mistaken for live traffic.
-import { mkdirSync, readFileSync, writeFileSync, renameSync, unlinkSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync, renameSync, unlinkSync, constants as fsConstants } from 'node:fs';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
 
 const IPC_DIR = path.join(os.homedir(), '.avanquest-pdf-viewer', 'ipc');
+const SAVE_DIR = path.join(IPC_DIR, 'saves');
 
 // A command/result older than this is a leftover from a dead session, not live
 // traffic — every live consumer polls sub-second while its own call timeout
@@ -39,6 +40,9 @@ const CHANNEL_TTL_MS = 60_000;
 // forever.
 const DOC_OPEN_TTL_MS = 30_000;
 const TOKEN_TTL_MS = 30 * 60 * 1000;
+// Orphaned save chunks (export abandoned mid-save, e.g. tab closed) must not
+// accumulate forever -- real exports finish in seconds, so this is generous.
+const SAVE_BUFFER_TTL_MS = 10 * 60 * 1000;
 
 function readJson<T>(file: string): T | null {
   try {
@@ -227,4 +231,72 @@ export function getFileToken(token: string): FileEntry | null {
   const entry = loadTokens()[token];
   if (!entry || entry.expiresAt <= Date.now()) return null;
   return entry;
+}
+
+// ── save_pdf chunk buffers (RDB-7731) ───────────────────────────────────────
+// Chunks of one save_pdf upload used to accumulate in a process-local
+// Map<string, Buffer[]>, on the (false, in Cowork mode) assumption that they
+// all arrive at the same server instance. When a later chunk lands in a
+// different instance, that instance's map never saw the earlier chunks, yet
+// the completion check (derived purely from the client-supplied offset)
+// still passed -- so the server wrote and reported success on a
+// truncated/wrong buffer. Same cross-instance problem as the command/token
+// channels above; same fix: keep the partial upload on disk under
+// saves/<hash>.part, keyed by a hash of the bufferKey (the raw key can
+// contain ':', invalid in Windows filenames).
+//
+// Each chunk is written at its explicit byte offset (not appended) so the
+// result doesn't depend on chunks arriving in order, and a retried chunk call
+// overwrites the same bytes instead of duplicating them.
+
+function saveBufferFileName(bufferKey: string): string {
+  return createHash('sha256').update(bufferKey).digest('hex') + '.part';
+}
+
+export function getSaveBufferPath(bufferKey: string): string {
+  return path.join(SAVE_DIR, saveBufferFileName(bufferKey));
+}
+
+export async function writeSaveChunk(bufferKey: string, offset: number, chunk: Buffer): Promise<void> {
+  await fs.mkdir(SAVE_DIR, { recursive: true });
+  // No O_APPEND: a fd opened in append mode ignores the explicit position
+  // passed to write() and always writes at EOF, which would break positional
+  // writes at `offset`.
+  const handle = await fs.open(getSaveBufferPath(bufferKey), fsConstants.O_CREAT | fsConstants.O_WRONLY);
+  try {
+    await handle.write(chunk, 0, chunk.length, offset);
+  } finally {
+    await handle.close();
+  }
+}
+
+export async function getSaveBufferSize(bufferKey: string): Promise<number> {
+  try {
+    const st = await fs.stat(getSaveBufferPath(bufferKey));
+    return st.size;
+  } catch {
+    return 0;
+  }
+}
+
+export async function removeSaveBuffer(bufferKey: string): Promise<void> {
+  await fs.unlink(getSaveBufferPath(bufferKey)).catch(() => {});
+}
+
+export async function pruneStaleSaveBuffers(): Promise<void> {
+  let entries;
+  try {
+    entries = await fs.readdir(SAVE_DIR, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  const now = Date.now();
+  await Promise.all(entries.map(async (e) => {
+    if (!e.isFile()) return;
+    const full = path.join(SAVE_DIR, e.name);
+    try {
+      const st = await fs.stat(full);
+      if (now - st.mtimeMs > SAVE_BUFFER_TTL_MS) await fs.unlink(full);
+    } catch { /* raced with a concurrent finalize/cleanup -- next sweep gets it */ }
+  }));
 }

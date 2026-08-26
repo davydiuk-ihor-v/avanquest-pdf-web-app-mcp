@@ -166,18 +166,20 @@ const DIAG_HTML_PATH = path.join(__dirname, 'diag.html');
 
 // File tokens live in shared-state.ts (disk-backed) so a token minted by the
 // MCP-side instance resolves in the widget-side instance in Cowork mode.
-// saveBuffers stays in memory: all chunks of one save_pdf upload arrive at the
-// same instance (the widget's), so they never cross a process boundary.
+//
+// RDB-7731: save_pdf's chunk buffer is disk-backed too (shared.writeSaveChunk
+// et al.) for the same reason -- Cowork can service two chunks of one upload
+// from different processes, so a process-local buffer silently lost chunks it
+// never saw while still reporting success. See shared-state.ts.
 //
 // RDB-8046: keyed by a per-export saveId (minted client-side per saveChunked()
 // call), NOT by the long-lived file token. The widget can trigger overlapping
 // exports for the same document (auto-save-on-command, the debounced
 // isModified auto-save, and manual Save/Save As/Export all reuse the same
 // token) -- keying by token let two concurrent exports' chunks land in one
-// shared array, so whichever finished first would Buffer.concat a mix of both
+// shared buffer, so whichever finished first would produce a mix of both
 // payloads into a truncated/corrupt file. saveId gives each export its own
-// buffer list so concurrent exports can never interleave.
-const saveBuffers = new Map<string, Buffer[]>();
+// buffer so concurrent exports can never interleave.
 
 // RDB-8046: even with per-export buffers, two complete exports finishing
 // around the same time can still race on the final fs.writeFile to the same
@@ -750,6 +752,7 @@ async function main(): Promise<void> {
     },
     async ({ token, chunk, offset, totalSize, savePath, saveId }) => {
       pruneExpired();
+      await shared.pruneStaleSaveBuffers();
       const entry = shared.getFileToken(token);
       if (!entry) {
         return {
@@ -761,15 +764,25 @@ async function main(): Promise<void> {
       // Fall back to token for older widget builds that don't send saveId yet
       // -- worse (no interleaving protection) but never worse than before.
       const bufferKey = saveId || token;
-      if (!saveBuffers.has(bufferKey)) saveBuffers.set(bufferKey, []);
       const chunkBuf = Buffer.from(chunk, 'base64');
-      saveBuffers.get(bufferKey)!.push(chunkBuf);
+      await shared.writeSaveChunk(bufferKey, offset, chunkBuf);
       const bytesReceived = offset + chunkBuf.length;
       if (bytesReceived >= totalSize) {
-        const full = Buffer.concat(saveBuffers.get(bufferKey)!);
-        saveBuffers.delete(bufferKey);
-        await serializeWrite(targetPath, () => fs.writeFile(targetPath, full));
-        console.error(`[save_pdf] saved ${full.length} bytes -> ${targetPath}`);
+        // RDB-7731: confirm what's actually durable on disk for this saveId --
+        // earlier chunks may have been written by a different process
+        // instance (Cowork), so this call's own offset can't prove it.
+        const persistedSize = await shared.getSaveBufferSize(bufferKey);
+        if (persistedSize < totalSize) {
+          console.error(`[save_pdf] incomplete buffer for ${bufferKey}: persisted ${persistedSize} of ${totalSize} bytes`);
+          return {
+            content: [{ type: 'text', text: JSON.stringify({ error: `Save incomplete: only ${persistedSize} of ${totalSize} bytes were durably received` }) }],
+            isError: true,
+          };
+        }
+        const tempPath = shared.getSaveBufferPath(bufferKey);
+        await serializeWrite(targetPath, () => fs.copyFile(tempPath, targetPath));
+        await shared.removeSaveBuffer(bufferKey);
+        console.error(`[save_pdf] saved ${persistedSize} bytes -> ${targetPath}`);
         return {
           content: [{ type: 'text', text: JSON.stringify({ done: true, savedPath: targetPath }) }],
         };
@@ -2205,7 +2218,7 @@ async function main(): Promise<void> {
     {
       title: 'Add Form Field',
       annotations: { readOnlyHint: false, destructiveHint: false },
-      description: 'Add a fillable form field (AcroForm widget) to a page in the currently open PDF. Position and size are percentages of page dimensions (0--100). Use x=0, width=100 to span the full page width. The internal field name (used by update_form_field/read_form_fields) is always auto-assigned by the engine (e.g. "Text1") — there is no way to set it to a custom value; `label` only controls the visible caption text.',
+      description: 'Add a fillable form field (AcroForm widget) to a page in the currently open PDF. Position and size are percentages of page dimensions (0--100). Use x=0, width=100 to span the full page width. Pass `field_name` to request the internal field name (used by update_form_field/read_form_fields) directly; if omitted, or if the engine does not honor it, one is auto-assigned (e.g. "Text1") -- check the response for the actual name applied. `label` only controls the visible caption text. For `listbox`, size `height` to the number of `options`: about 4--5% of page height per visible option, so the box does not end up mostly empty or so cramped that options overlap.',
       inputSchema: {
         page: z.coerce.number().int().min(1).describe('1-based page number'),
         field_type: z.enum(['text', 'checkbox', 'radio', 'dropdown', 'listbox', 'button']).describe('Field type'),
@@ -2213,24 +2226,25 @@ async function main(): Promise<void> {
         y: z.coerce.number().min(0).max(100).describe('Top position as % of page height'),
         width: z.coerce.number().min(0).max(100).describe('Width as % of page width (use 100 for full-width)'),
         height: z.coerce.number().min(0).max(100).describe('Height as % of page height'),
-        label: z.string().optional().describe('Caption / label text shown on the field. This is NOT the internal field name — the engine always auto-assigns that.'),
+        label: z.string().optional().describe('Caption / label text shown on the field. This is NOT the internal field name -- pass field_name for that.'),
+        field_name: z.string().optional().describe('Requested internal field name. Must be unique within the document; the call fails with the list of existing names if it collides. Not guaranteed to be honored by the engine -- always use the field_name in the response for update_form_field/read_form_fields.'),
         default_value: z.string().optional().describe('Initial field value'),
         options: z.array(z.string()).optional().describe('Choice options for dropdown/listbox fields'),
         bg_color: z.string().optional().describe('Background color hex e.g. #FFFFFF'),
         border_color: z.string().optional().describe('Border color hex e.g. #000000'),
       },
     },
-    async ({ page, field_type, x, y, width, height, label, default_value, options, bg_color, border_color }) => {
+    async ({ page, field_type, x, y, width, height, label, field_name, default_value, options, bg_color, border_color }) => {
       const nc = normalizeColors({ bg_color, border_color });
       if (!nc.ok) return nok(nc.error);
       return pollViewerResult<{ success: boolean; field_name?: string | null; error?: string }>(
-        { type: 'add_form_field', page, field_type, x, y, width, height, label: label ?? null, default_value: default_value ?? null, options: options ?? null, bg_color: nc.colors.bg_color ?? null, border_color: nc.colors.border_color ?? null },
+        { type: 'add_form_field', page, field_type, x, y, width, height, label: label ?? null, field_name: field_name ?? null, default_value: default_value ?? null, options: options ?? null, bg_color: nc.colors.bg_color ?? null, border_color: nc.colors.border_color ?? null },
         'add_form_field',
         15_000,
         (d) => {
           if (!d.success) return nok(`Error: ${d.error}`);
-          const nameNote = label
-            ? ` Note: the internal field name is engine-assigned and cannot be set to "${label}" — that was applied as the visible label instead. Use "${d.field_name}" for update_form_field/read_form_fields.`
+          const nameNote = field_name && d.field_name !== field_name
+            ? ` Note: requested name "${field_name}" was not applied by the engine -- use "${d.field_name}" for update_form_field/read_form_fields.`
             : '';
           return ok(`Form field added to page ${page}${d.field_name ? ` (field name: "${d.field_name}")` : ''}.${nameNote}`);
         },
