@@ -733,6 +733,40 @@ async function main(): Promise<void> {
     },
   );
 
+  // RDB-8115: renewing the token on every get_viewer_command poll (below)
+  // only helps while the widget is actually polling. A document left open
+  // through a long background/inactive stretch (throttled iframe, laptop
+  // sleep, or just genuinely not touched for a while) can still outlive
+  // TOKEN_TTL_MS with no poll ever landing to renew it -- confirmed by QA
+  // still hitting "token expired" after that fix. The widget always knows
+  // the real filesystem path of its own open document (_currentFilePath),
+  // independent of whatever happened to the server-side token, so let it
+  // self-heal: mint a fresh token for that same (still-open, still-valid)
+  // file on demand instead of only ever erroring out. Same path validation
+  // as display_pdf (resolveAllowedPdf) -- this doesn't touch the viewer or
+  // re-open anything, just re-establishes a token save_pdf can use.
+  registerAppTool(
+    server,
+    'refresh_file_token',
+    {
+      title: 'Refresh File Token',
+      annotations: { readOnlyHint: true, destructiveHint: false },
+      description: 'Internal: mint a fresh file token for an already-open local PDF whose token expired.',
+      inputSchema: {
+        filePath: z.string(),
+      },
+      _meta: { ui: { resourceUri, visibility: ['app'] as const } },
+    },
+    async ({ filePath }) => {
+      const resolved = resolveAllowedPdf(filePath);
+      if (!resolved.ok) {
+        return { content: [{ type: 'text', text: JSON.stringify({ error: resolved.reason }) }], isError: true };
+      }
+      const token = mintToken(resolved.absolute, path.basename(resolved.absolute));
+      return { content: [{ type: 'text', text: JSON.stringify({ token }) }] };
+    },
+  );
+
   registerAppTool(
     server,
     'save_pdf',
