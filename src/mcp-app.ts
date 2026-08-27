@@ -1215,7 +1215,7 @@ const COMPRESS_QUALITY: Record<string, number> = {
   max: 0.15, high: 0.25, medium: 0.5, low: 0.75, min: 1.0,
 };
 
-async function saveChunked(bytes: Uint8Array, targetPath: string, label = 'Saving', silent = false): Promise<void> {
+async function saveChunked(bytes: Uint8Array, targetPath: string, label = 'Saving', silent = false, _isRetry = false): Promise<void> {
   const totalSize = bytes.length;
   // RDB-8046: every call gets its own id so the server never mixes this
   // export's chunks with a concurrent one for the same token (auto-save on
@@ -1237,7 +1237,30 @@ async function saveChunked(bytes: Uint8Array, targetPath: string, label = 'Savin
     // expired file token), so every caller's try/catch never fired and
     // saveFileBytes went straight to "PDF saved successfully" regardless.
     const data = JSON.parse((result.content[0] as { text: string }).text) as { error?: string };
-    if (data.error) throw new Error(data.error);
+    if (data.error) {
+      // RDB-8115: renewing the token on every get_viewer_command poll only
+      // helps while the widget is actively polling -- a document left open
+      // through a long enough background/inactive stretch (throttled iframe,
+      // sleep, etc.) can still outlive TOKEN_TTL_MS with no poll ever landing
+      // to renew it. _currentFilePath is a real filesystem path for a
+      // locally-opened document (for a pdfUrl-based open it's the source URL
+      // instead, where refreshing a file token isn't meaningful) -- self-heal
+      // by minting a fresh token for that same, still-perfectly-valid file
+      // and retrying once, instead of only ever erroring out.
+      const isLocalPath = !/^https?:\/\//i.test(_currentFilePath);
+      if (!_isRetry && isLocalPath && /token expired/i.test(data.error)) {
+        const refreshRes = await (app as any).callServerTool({
+          name: 'refresh_file_token',
+          arguments: { filePath: _currentFilePath },
+        });
+        const refreshData = JSON.parse((refreshRes.content[0] as { text: string }).text) as { token?: string; error?: string };
+        if (refreshData.token) {
+          _currentToken = refreshData.token;
+          return saveChunked(bytes, targetPath, label, silent, true);
+        }
+      }
+      throw new Error(data.error);
+    }
     offset += chunk.length;
     if (!silent) showSaveProgress(label, (offset / totalSize) * 100);
   }

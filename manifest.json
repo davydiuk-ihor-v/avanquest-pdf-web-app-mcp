@@ -2,7 +2,7 @@
   "manifest_version": "0.4",
   "name": "avanquest-pdf-mcp-editor",
   "display_name": "Avanquest PDF Editor",
-  "version": "0.4.351",
+  "version": "0.4.352",
   "description": "View and edit PDF files inside Claude Desktop using the Avanquest PDF web viewer.",
   "long_description": "Provides a display_pdf tool that opens a local PDF file in an interactive editor rendered inline in the Claude Desktop chat. Powered by @avanquest/pdf-web-viewer.",
   "author": {
@@ -330,6 +330,10 @@
     {
       "name": "read_pdf_bytes_by_token",
       "description": "Internal: read PDF bytes for the viewer iframe via the MCP channel."
+    },
+    {
+      "name": "refresh_file_token",
+      "description": "Internal: mint a fresh file token for an already-open local PDF whose token expired."
     },
     {
       "name": "report_viewer_result",
