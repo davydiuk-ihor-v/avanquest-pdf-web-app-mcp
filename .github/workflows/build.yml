@@ -10,6 +10,17 @@ on:
     branches: [main]
   release:
     types: [published]
+  # Manual fallback/unblock: the `release` trigger above has not been firing
+  # reliably (observed: publishing v1.0.1 produced zero workflow runs at all
+  # for the `release` event, per repo Settings/Actions history) -- lets a
+  # human build + attach the .mcpb to an already-published release without
+  # waiting on that to be root-caused.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to attach the built .mcpb to (leave empty to just build, without attaching)'
+        required: false
+        type: string
 
 jobs:
   build:
@@ -44,7 +55,7 @@ jobs:
           path: avanquest-pdf-mcp-editor.mcpb
 
       - name: Attach to release
-        if: github.event_name == 'release'
+        if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.tag != '')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${{ github.event.release.tag_name }}" avanquest-pdf-mcp-editor.mcpb
+        run: gh release upload "${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag }}" avanquest-pdf-mcp-editor.mcpb --clobber

@@ -2868,6 +2868,16 @@ async function main(): Promise<void> {
       if (shared.isDocOpenPending()) {
         return { content: [{ type: 'text' as const, text: JSON.stringify({ command: null }) }] };
       }
+      // RDB-8115: renew THIS widget's own file token on every poll, BEFORE the
+      // "latest document" gate below -- an earlier chat turn's widget (see the
+      // RDB-7811 comment on that gate) is still a legitimately open document
+      // that must keep being able to save even though it no longer wins
+      // command routing. Gating this on "latest" too (as an earlier version
+      // of this fix did) left every non-latest-but-still-open document's
+      // token to expire after TOKEN_TTL_MS regardless of it still being
+      // actively polled, reproducing the exact "save fails after ~30 min"
+      // bug for any document other than the most recently opened one.
+      if (token) shared.touchFileToken(token);
       // RDB-7811: earlier chat turns' display_pdf/split_pdf/etc. renders leave
       // their widget iframe mounted (scrolled out of view, not destroyed), and
       // each one independently polls this same shared command channel — with
@@ -2882,12 +2892,6 @@ async function main(): Promise<void> {
       if (!token || (latest?.token && latest.token !== token)) {
         return { content: [{ type: 'text' as const, text: JSON.stringify({ command: null }) }] };
       }
-      // RDB-8115: this poll (~800ms while the document stays open, see
-      // startViewerCommandPoller) is the one thing that reliably keeps
-      // firing regardless of user idle time -- piggyback the file token's
-      // renewal on it so a document left open for longer than TOKEN_TTL_MS
-      // doesn't have save_pdf start failing with "token expired".
-      shared.touchFileToken(token);
       const cmd = shared.takeViewerCommand();
       return {
         content: [{ type: 'text' as const, text: JSON.stringify({ command: cmd }) }],
