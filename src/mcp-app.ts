@@ -933,18 +933,6 @@ async function saveFileBytes(bytes: Uint8Array, defaultPath: string): Promise<vo
 
 let editorReady: Promise<ViewerResult> | null = null;
 
-// The vendor viewer auto-fits its initial zoom to whatever size our
-// container happens to be at construction time — which can be tiny, since
-// the host reports our real allocated size asynchronously (after PdfEditor()
-// is already constructed), and that initial fit-zoom never recomputes once
-// our container grows. Force a sane, predictable 100% zoom right after each
-// document loads instead of trusting the auto-fit.
-// Bounded window (ms) during which we fight the vendor's own auto-fit
-// recompute on every container resize (see applyDefaultViewSettings below).
-// Past this we stop, so a manual zoom the user makes later isn't fought.
-const ZOOM_FIX_WINDOW_MS = 15_000;
-let _zoomFixObserver: ResizeObserver | null = null;
-
 // RDB-8130: the vendor's own document-open handling reads the PDF's embedded
 // /PageLayout viewer preference (Catalog entry) and, if present, re-applies
 // it via setLayout() one tick after open (a deferred setTimeout(...,0) in its
@@ -959,16 +947,11 @@ const LAYOUT_FIX_POLL_MS = 200;
 let _layoutFixInterval: ReturnType<typeof setInterval> | null = null;
 
 function applyDefaultViewSettings(docVm: any): void {
-  // A new document replaces whichever one the previous observer/subscription
-  // was guarding — stop them so they don't keep correcting a stale docVm.
-  _zoomFixObserver?.disconnect();
+  // A new document replaces whichever one the previous subscription was
+  // guarding — stop it so it doesn't keep correcting a stale docVm.
   if (_layoutFixInterval) clearInterval(_layoutFixInterval);
   watchDocumentModifications(docVm);
 
-  // setLayout first: switching layout mode can reset the page-view fit mode
-  // back to its own default, so it must not run after — and thereby undo —
-  // the actual-size + forced zoom below.
-  //
   // 'continuous' = single-page view WITH scrolling in the vendor's view-mode
   // map (its "Enable scrolling" menu toggle switches single <-> continuous).
   // RDB-7720 originally forced 'single' (no scrolling) here; reverted per the
@@ -995,28 +978,6 @@ function applyDefaultViewSettings(docVm: any): void {
       if (docVm?.getLayout?.() !== 'continuous') docVm?.setLayout?.('continuous');
     } catch (_) { /* non-fatal */ }
   }, LAYOUT_FIX_POLL_MS);
-  // actualSize tells the viewer to honor our explicit zoom instead of
-  // auto-fitting, otherwise setZoom() below is silently ignored.
-  const forceActualSizeZoom = () => {
-    try { docVm?.setPageView?.('actual-size'); } catch (_) { /* non-fatal */ }
-    try { docVm?.setZoom?.(1); } catch (_) { /* non-fatal */ }
-  };
-  forceActualSizeZoom();
-
-  // The host reports our real allocated container size asynchronously, and
-  // the vendor's own auto-fit recomputes against it once that lands —
-  // silently reverting the actual-size + 100% zoom forced above (RDB-7720).
-  // How long that takes varies with document/asset size (a fixed handful of
-  // setTimeout retries missed it for larger documents), so react to the
-  // actual resize instead of guessing delays: re-apply on every #viewer
-  // resize for a bounded window after open, which also covers the initial
-  // size ResizeObserver reports immediately upon observe().
-  const deadline = Date.now() + ZOOM_FIX_WINDOW_MS;
-  _zoomFixObserver = new ResizeObserver(() => {
-    if (Date.now() > deadline) { _zoomFixObserver?.disconnect(); return; }
-    forceActualSizeZoom();
-  });
-  _zoomFixObserver.observe(viewerEl);
 }
 
 // Mount the viewer once. `initialFile`, when given, is opened by the viewer as
