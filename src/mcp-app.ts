@@ -200,7 +200,20 @@ function isBenignVendorError(msg: string): boolean {
     // callback itself changes layout enough to need another observation
     // pass in the same frame (e.g. the page thumbnail grid reflowing after
     // its own resize). Harmless and unrelated to any operation's outcome.
-    || msg.includes('ResizeObserver loop completed with undelivered notifications');
+    || msg.includes('ResizeObserver loop completed with undelivered notifications')
+    // RDB-8133: thrown whenever an edit command (Draw, Add text, etc.) hits
+    // an owner-password restriction. The vendor's own UI already shows the
+    // correct password dialog for this via a separate
+    // documentView.ownerPasswordDialogShow() subscription -- this is not a
+    // real failure to surface, just noise racing ahead of that dialog. Two
+    // different messages observed for this same case depending on the call
+    // path: the SDK's own PdfEditorAccessDeniedError ("Owner password is
+    // required to perform this operation") and, for annotation-creating
+    // commands (createAnnotation -> worker checkError), a message baked into
+    // the compiled WASM worker itself ("This action is not allowed by the
+    // document's security settings.") -- keep both since either can occur.
+    || msg.includes('Owner password is required to perform this operation')
+    || msg.includes("This action is not allowed by the document's security settings");
 }
 
 window.addEventListener('error', (e) => {
