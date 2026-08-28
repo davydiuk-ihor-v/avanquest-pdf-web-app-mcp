@@ -1829,11 +1829,21 @@ function isTransientEngineError(err: unknown): boolean {
   return /json\.exception\.type_error/.test(msg);
 }
 
-async function withEngineRetry<T>(fn: () => Promise<T>, attempts = 6, baseDelayMs = 200): Promise<T> {
+async function withEngineRetry<T>(fn: () => Promise<T>, attempts = 6, baseDelayMs = 200, label = 'engine call'): Promise<T> {
+  // RDB-8167 diagnostic: log every attempt (not just the final failure) via
+  // show()'s silent beacon channel -- enable "Enable debug logging" in this
+  // extension's Configure screen, reproduce, then check Claude Desktop's
+  // main.log for `[iframe] engineRetry:` lines to see the full attempt
+  // sequence (timing, which attempt succeeded/exhausted, exact error each
+  // time) instead of only the final outcome we already show on failure.
   for (let i = 0; i < attempts; i++) {
     try {
-      return await fn();
+      const result = await fn();
+      if (i > 0) show(`engineRetry: ${label} succeeded on attempt ${i + 1}/${attempts}`);
+      return result;
     } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      show(`engineRetry: ${label} attempt ${i + 1}/${attempts} failed: ${msg}`);
       if (i === attempts - 1 || !isTransientEngineError(err)) throw err;
       // Backoff instead of a fixed delay: 3 quick retries weren't enough to
       // reliably clear this (RDB-7908 add_form_field still surfaced the error
@@ -4017,11 +4027,6 @@ async function handleAddFormField(data: AddFormFieldCommand): Promise<void> {
     };
     const FT = ftMap[data.field_type] ?? 'TextBox';
 
-    // RDB-7907: ICreateAnnotationParams doesn't declare N in the SDK's own
-    // .d.ts, but the type already has several loosely-typed pass-through
-    // fields (R/O typed `unknown`) -- passing N anyway costs nothing and
-    // tells us definitively whether the engine's worker protocol honors it
-    // regardless of what the public type declares.
     const requestedName = data.field_name?.trim() || null;
     if (requestedName) {
       const existingNames = ((doc.acroforms ?? []) as any[]).map((f) => f.fieldName).filter(Boolean);
@@ -4033,21 +4038,41 @@ async function handleAddFormField(data: AddFormFieldCommand): Promise<void> {
     // RDB-8051: without an explicit font size, the engine renders the
     // field's own value/options far too large for the box (looks auto-fit to
     // the widget height). checkbox/radio/button don't display readable text
-    // (glyph or CA caption instead), so only the text-bearing types need it.
+    // (glyph or CA caption instead), so only the text-bearing types need it
+    // -- applied via the post-creation reinforcement patch below, not here
+    // (see RDB-8167 comment above params.BC).
     const FIELD_FONT_SIZE = 10;
-    const FIELD_TEXT_TYPES = new Set(['text', 'dropdown', 'listbox']);
 
     const params: Record<string, unknown> = {
       T: 'Widget',
       FT,
       R: [left, pdfBottom, right, pdfTop],
     };
-    if (requestedName) params.N = requestedName;
     // CA (Caption) only works for PushButton; for other types we add a FreeText label separately
     if (data.field_type === 'button' && data.label != null) params.CA = data.label;
     if (data.bg_color != null) params.BG = data.bg_color;
     if (data.border_color != null) params.BC = data.border_color;
-    if (FIELD_TEXT_TYPES.has(data.field_type)) params.Fnt = { S: FIELD_FONT_SIZE, F: 'Helvetica' };
+    // RDB-8167: the vendor's own UI widget-creation code (ui/chunks --
+    // the class backing its "drag to create a form field" toolbar tool)
+    // unconditionally sets O:{} for ComboBox/ListBox at creation time, even
+    // though it's immediately replaced by the "Items" dialog's own separate
+    // patch afterward. Removing O entirely (rather than sending it empty)
+    // was the actual regression: the engine appears to require the key's
+    // *presence* at creation for Ch-field init, not any particular content --
+    // its absence, not its earlier non-empty content, is what the
+    // json.exception.type_error.302 was reacting to all along. Restore the
+    // empty placeholder to match the one payload shape actually exercised by
+    // the shipped product; the real options still go through the separate
+    // changeAnnotationProperties patch below unchanged.
+    if (data.field_type === 'dropdown' || data.field_type === 'listbox') params.O = {};
+    // RDB-8167: Fnt in createAnnotation's own params destabilizes ComboBox/
+    // ListBox creation the same way N and (earlier) O did -- same
+    // json.exception.type_error.302 signature, reproduced with nothing else
+    // non-minimal in the payload. The font-size reinforcement patch below
+    // (applied via a separate changeAnnotationProperties call after creation,
+    // same split-into-its-own-call pattern as O/N) already covers every
+    // FIELD_TEXT_TYPES case on its own, so dropping it from creation costs
+    // nothing.
 
     if (data.field_type === 'checkbox') {
       params.V = data.default_value === 'Yes' ? 'Yes' : 'Off';
@@ -4059,9 +4084,15 @@ async function handleAddFormField(data: AddFormFieldCommand): Promise<void> {
     // withEngineRetry above) — createAnnotation itself, or the follow-up
     // changeAnnotationProperties — instead of one generic "add_form_field
     // error" that gives no way to tell which call and payload were involved.
+    // RDB-8167 diagnostic: log the exact outgoing payload once per call site
+    // (it's identical across retries of the same call, so no need to repeat
+    // it per attempt) -- enable "Enable debug logging" in this extension's
+    // Configure screen and check Claude Desktop's main.log for `[iframe]
+    // engineSend:` lines to see precisely what we send, not just the error.
+    show(`engineSend: createAnnotation(pageIndex=${pageIndex}, params=${JSON.stringify(params)})`);
     let response: any;
     try {
-      response = await withEngineRetry(() => (doc as any).createAnnotation({ pageIndex, params }));
+      response = await withEngineRetry(() => (doc as any).createAnnotation({ pageIndex, params }), 6, 200, `createAnnotation(FT=${FT})`);
     } catch (err) {
       throw new Error(`createAnnotation(FT=${FT}, params=${JSON.stringify(params)}) failed: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -4093,15 +4124,18 @@ async function handleAddFormField(data: AddFormFieldCommand): Promise<void> {
         const annotIndex = findCreatedAnnotIndex();
         if (annotIndex >= 0) {
           const optionsProperties = { field: { O: data.options!.map((o) => ({ name: o, value: o })) } };
+          show(`engineSend: changeAnnotationProperties(options) annotIndex=${annotIndex}, pageIndex=${pageIndex}, properties=${JSON.stringify(optionsProperties)}`);
           try {
-            await withEngineRetry(() => (doc as any).changeAnnotationProperties(annotIndex, pageIndex, optionsProperties, 'Widget'));
+            await withEngineRetry(() => (doc as any).changeAnnotationProperties(annotIndex, pageIndex, optionsProperties, 'Widget'), 6, 200, 'changeAnnotationProperties(options)');
           } catch (err) {
             throw new Error(`changeAnnotationProperties(annotIndex=${annotIndex}, pageIndex=${pageIndex}, properties=${JSON.stringify(optionsProperties)}) failed: ${err instanceof Error ? err.message : String(err)}`);
           }
           // Font reinforcement is cosmetic -- keep it best-effort so a font
           // hiccup never costs the (working, load-bearing) options patch.
+          const fontProperties1 = { Fnt: { S: FIELD_FONT_SIZE, F: 'Helvetica' } };
+          show(`engineSend: changeAnnotationProperties(font) annotIndex=${annotIndex}, pageIndex=${pageIndex}, properties=${JSON.stringify(fontProperties1)}`);
           try {
-            await withEngineRetry(() => (doc as any).changeAnnotationProperties(annotIndex, pageIndex, { Fnt: { S: FIELD_FONT_SIZE, F: 'Helvetica' } }, 'Widget'));
+            await withEngineRetry(() => (doc as any).changeAnnotationProperties(annotIndex, pageIndex, fontProperties1, 'Widget'), 6, 200, 'changeAnnotationProperties(font, dropdown/listbox with options)');
           } catch { /* font reinforcement is best-effort */ }
         } else {
           throw new Error(`could not locate created annotation on page ${pageIndex} (response.annot=${JSON.stringify(response?.annot)})`);
@@ -4112,7 +4146,9 @@ async function handleAddFormField(data: AddFormFieldCommand): Promise<void> {
         try {
           const annotIndex = findCreatedAnnotIndex();
           if (annotIndex >= 0) {
-            await withEngineRetry(() => (doc as any).changeAnnotationProperties(annotIndex, pageIndex, { Fnt: { S: FIELD_FONT_SIZE, F: 'Helvetica' } }, 'Widget'));
+            const fontProperties2 = { Fnt: { S: FIELD_FONT_SIZE, F: 'Helvetica' } };
+            show(`engineSend: changeAnnotationProperties(font) annotIndex=${annotIndex}, pageIndex=${pageIndex}, properties=${JSON.stringify(fontProperties2)}`);
+            await withEngineRetry(() => (doc as any).changeAnnotationProperties(annotIndex, pageIndex, fontProperties2, 'Widget'), 6, 200, 'changeAnnotationProperties(font, dropdown/listbox no options)');
           }
         } catch { /* font reinforcement is best-effort */ }
       }
@@ -4124,9 +4160,33 @@ async function handleAddFormField(data: AddFormFieldCommand): Promise<void> {
       try {
         const annotIndex = findCreatedAnnotIndex();
         if (annotIndex >= 0) {
-          await withEngineRetry(() => (doc as any).changeAnnotationProperties(annotIndex, pageIndex, { Fnt: { S: FIELD_FONT_SIZE, F: 'Helvetica' } }, 'Widget'));
+          const fontProperties3 = { Fnt: { S: FIELD_FONT_SIZE, F: 'Helvetica' } };
+          show(`engineSend: changeAnnotationProperties(font) annotIndex=${annotIndex}, pageIndex=${pageIndex}, properties=${JSON.stringify(fontProperties3)}`);
+          await withEngineRetry(() => (doc as any).changeAnnotationProperties(annotIndex, pageIndex, fontProperties3, 'Widget'), 6, 200, 'changeAnnotationProperties(font, text)');
         }
       } catch { /* font reinforcement is best-effort */ }
+    }
+
+    // RDB-8167: passing N (requested field name) directly in createAnnotation's
+    // params destabilized ComboBox/ListBox creation the same way O once did --
+    // N belongs to the FormField schema, not the Widget annotation's own
+    // creation payload (see the api_reference.md CreateAnnot/Widget section:
+    // no N there), and bundling an out-of-schema key into that payload
+    // apparently corrupts something engine-side for Choice fields specifically
+    // (matches the exact json.exception.type_error.302 signature already seen
+    // for O). Try applying it as its own separate best-effort patch afterward
+    // instead -- consistent with how O/Fnt are already split out above, and
+    // already documented as "not guaranteed to be honored" in the tool schema,
+    // so a failed/no-op patch here is not a regression.
+    if (requestedName) {
+      try {
+        const annotIndex = findCreatedAnnotIndex();
+        if (annotIndex >= 0) {
+          const nameProperties = { field: { N: requestedName } };
+          show(`engineSend: changeAnnotationProperties(name) annotIndex=${annotIndex}, pageIndex=${pageIndex}, properties=${JSON.stringify(nameProperties)}`);
+          await withEngineRetry(() => (doc as any).changeAnnotationProperties(annotIndex, pageIndex, nameProperties, 'Widget'), 6, 200, 'changeAnnotationProperties(name)');
+        }
+      } catch { /* requested name is best-effort -- engine auto-assigns one regardless */ }
     }
 
     // RDB-7907: passing V in the createAnnotation params above is unreliable
@@ -4153,15 +4213,15 @@ async function handleAddFormField(data: AddFormFieldCommand): Promise<void> {
       const labelPdfTop = Math.min(ph - 1, pdfTop + LABEL_FONT_SIZE * 1.2 + LABEL_GAP_PT);
       try {
         const labelFont = { S: LABEL_FONT_SIZE, F: 'Helvetica', C: '#FF000000' };
-        await withEngineRetry(() => (doc as any).createTextBlock({ pageIndex, font: labelFont, position: [left, labelPdfTop] }));
+        show(`engineSend: createTextBlock(label) pageIndex=${pageIndex}, font=${JSON.stringify(labelFont)}, position=${JSON.stringify([left, labelPdfTop])}`);
+        await withEngineRetry(() => (doc as any).createTextBlock({ pageIndex, font: labelFont, position: [left, labelPdfTop] }), 6, 200, 'createTextBlock(label)');
         const pageModel = (doc as any).pages?.[pageIndex] ?? pages[pageIndex];
         if (!pageModel.isLoaded) await (doc as any).loadPageContent(pageModel);
         const newIdx = ((pageModel.textBlocks as unknown[]) ?? []).length - 1;
         if (newIdx >= 0) {
-          await withEngineRetry(() => (doc as any).editPageText({
-            pageIndex,
-            textblocks: [{ index: newIdx, spans: [{ text: data.label, font: labelFont }] }],
-          }));
+          const editPageTextData = { pageIndex, textblocks: [{ index: newIdx, spans: [{ text: data.label, font: labelFont }] }] };
+          show(`engineSend: editPageText(label) ${JSON.stringify(editPageTextData)}`);
+          await withEngineRetry(() => (doc as any).editPageText(editPageTextData), 6, 200, 'editPageText(label)');
         }
       } catch { /* label is optional */ }
     }
