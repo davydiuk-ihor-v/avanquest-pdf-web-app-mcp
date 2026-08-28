@@ -50,8 +50,16 @@ function b64ToBytes(b64: string): Uint8Array {
 }
 
 async function loadBytes(rel: string): Promise<Uint8Array> {
-  const mod = (await import(/* @vite-ignore */ `${base}mod/${rel}`)) as { default: string | null };
-  if (!mod.default) throw new Error(`asset not found: ${rel}`);
+  // RDB-8244: the server always answers 200 here (see sendModError in
+  // server.ts) so this import() itself can't fail as a bare network error
+  // anymore -- a missing/expired file surfaces as `mod.default === null`
+  // with `error`/`code` we can act on, instead of a raw TypeError.
+  const mod = (await import(/* @vite-ignore */ `${base}mod/${rel}`)) as { default: string | null; error?: string; code?: string | null };
+  if (!mod.default) {
+    const err = new Error(mod.error || `asset not found: ${rel}`);
+    if (mod.code) (err as Error & { code?: string }).code = mod.code;
+    throw err;
+  }
   return b64ToBytes(mod.default);
 }
 
@@ -1149,6 +1157,12 @@ function initEditor(initialFile?: File): Promise<ViewerResult> {
   return editorReady;
 }
 
+// RDB-8244: shown when a PDF referenced by chat history (or its token) is no
+// longer reachable -- e.g. the file was deleted/moved since it was opened, or
+// the token expired across a remount. Both fileFromToken paths below funnel
+// a "file_not_found" code here instead of surfacing the raw fetch/fs error.
+const FILE_NOT_FOUND_MESSAGE = 'The file could not be opened because it no longer exists at the original location.';
+
 async function fileFromToken(token: string, name: string, filePath?: string): Promise<File> {
   // In web contexts (Cowork / claude.ai) dynamic import('http://...') is blocked
   // as mixed content. Use the MCP channel instead.
@@ -1157,15 +1171,21 @@ async function fileFromToken(token: string, name: string, filePath?: string): Pr
       name: 'read_pdf_bytes_by_token',
       arguments: { token, filePath },
     });
-    const data = JSON.parse(result.content[0].text) as { base64?: string; error?: string };
+    const data = JSON.parse(result.content[0].text) as { base64?: string; error?: string; code?: string };
+    if (data.code === 'file_not_found') throwFriendlyOpenError(FILE_NOT_FOUND_MESSAGE);
     if (data.error) throw new Error(data.error);
     if (!data.base64) throw new Error('empty response from read_pdf_bytes_by_token');
     return new File([b64ToBytes(data.base64).buffer as ArrayBuffer], name, { type: 'application/pdf' });
   }
   // Desktop: fetch via HTTP import channel.
   const q = filePath ? `?fp=${encodeURIComponent(filePath)}` : '';
-  const bytes = await loadBytes(`file/${token}${q}`);
-  return new File([bytes.buffer as ArrayBuffer], name, { type: 'application/pdf' });
+  try {
+    const bytes = await loadBytes(`file/${token}${q}`);
+    return new File([bytes.buffer as ArrayBuffer], name, { type: 'application/pdf' });
+  } catch (err) {
+    if ((err as Error & { code?: string }).code === 'file_not_found') throwFriendlyOpenError(FILE_NOT_FOUND_MESSAGE);
+    throw err;
+  }
 }
 
 async function openPdf(token: string, name: string, filePath?: string): Promise<void> {

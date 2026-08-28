@@ -515,6 +515,19 @@ async function startAssetServer(): Promise<{ port: number; baseUrl: string }> {
     res.type('application/javascript').send(`self.__pwv_xhr_result = ${JSON.stringify(payload)};`);
   });
 
+  // RDB-8244: a non-2xx status here makes the browser's dynamic import()
+  // fail as a bare network error ("Failed to fetch dynamically imported
+  // module") *before* it ever reads the response body -- so every reason we
+  // used to embed as a JS comment (token expired, file deleted, forbidden
+  // path, ...) never actually reached the client. Always answer 200 and
+  // carry the failure as a real export instead, so callers can branch on
+  // `mod.error`/`mod.code` and show something better than a raw TypeError.
+  function sendModError(res: import('express').Response, message: string, code?: string): void {
+    res.type('application/javascript').status(200).send(
+      `export default null; export const error = ${JSON.stringify(message)}; export const code = ${JSON.stringify(code ?? null)};`,
+    );
+  }
+
   // Same workaround for binary assets: wrap any served file as an ES module
   // exporting base64, importable where fetch() is forbidden.
   app.get(/^\/mod\/(.+)$/, async (req, res) => {
@@ -531,25 +544,37 @@ async function startAssetServer(): Promise<{ port: number; baseUrl: string }> {
           // query param if provided (passed by fileFromToken as a safety net).
           const fp = String(req.query.fp ?? '');
           if (!fp) {
-            res.type('application/javascript').status(404).send('export default null; // not found or expired');
+            sendModError(res, 'not found or expired', 'file_not_found');
             return;
           }
           const tmpDir = os.tmpdir();
           const resolved = resolveAllowedPdf(fp);
           const isInTmp = fp.startsWith(tmpDir + path.sep) || fp.startsWith(tmpDir + '/');
           if (!resolved.ok && !isInTmp) {
-            res.type('application/javascript').status(403).send(`export default null; // ${resolved.reason}`);
+            sendModError(res, resolved.reason, 'forbidden');
             return;
           }
           const readPath = resolved.ok ? resolved.absolute : fp;
-          buf = await fs.readFile(readPath);
+          try {
+            buf = await fs.readFile(readPath);
+          } catch (err) {
+            const code = (err as NodeJS.ErrnoException).code === 'ENOENT' ? 'file_not_found' : undefined;
+            sendModError(res, (err as Error).message, code);
+            return;
+          }
         } else {
-          buf = await fs.readFile(entry.fullPath);
+          try {
+            buf = await fs.readFile(entry.fullPath);
+          } catch (err) {
+            const code = (err as NodeJS.ErrnoException).code === 'ENOENT' ? 'file_not_found' : undefined;
+            sendModError(res, (err as Error).message, code);
+            return;
+          }
         }
       } else if (rel.startsWith('ui/') || rel.startsWith('public/')) {
         const abs = path.resolve(viewerRoot, rel);
         if (!abs.startsWith(viewerRoot + path.sep)) {
-          res.type('application/javascript').status(403).send('export default null; // forbidden');
+          sendModError(res, 'forbidden');
           return;
         }
         try {
@@ -563,12 +588,12 @@ async function startAssetServer(): Promise<{ port: number; baseUrl: string }> {
           buf = await fs.readFile(path.join(path.dirname(abs), real));
         }
       } else {
-        res.type('application/javascript').status(404).send('export default null; // unknown asset class');
+        sendModError(res, 'unknown asset class');
         return;
       }
       res.type('application/javascript').send(`export default "${buf.toString('base64')}";`);
     } catch (err) {
-      res.type('application/javascript').status(404).send(`export default null; // ${(err as Error).message}`);
+      sendModError(res, (err as Error).message);
     }
   });
 
@@ -993,13 +1018,16 @@ async function main(): Promise<void> {
         readPath = resolved.ok ? resolved.absolute : (isInTmp ? filePath : null);
       }
       if (!readPath) {
-        return { content: [{ type: 'text', text: JSON.stringify({ error: 'PDF not found or token expired' }) }] };
+        return { content: [{ type: 'text', text: JSON.stringify({ error: 'PDF not found or token expired', code: 'file_not_found' }) }] };
       }
       try {
         const buf = await fs.readFile(readPath);
         return { content: [{ type: 'text', text: JSON.stringify({ base64: buf.toString('base64') }) }] };
       } catch (err) {
-        return { content: [{ type: 'text', text: JSON.stringify({ error: (err as Error).message }) }] };
+        // RDB-8244: tag ENOENT so the widget can show a friendly "file no
+        // longer exists" message instead of the raw fs error.
+        const code = (err as NodeJS.ErrnoException).code === 'ENOENT' ? 'file_not_found' : undefined;
+        return { content: [{ type: 'text', text: JSON.stringify({ error: (err as Error).message, code }) }] };
       }
     },
   );
