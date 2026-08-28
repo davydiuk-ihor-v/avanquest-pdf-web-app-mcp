@@ -216,6 +216,40 @@ function isBenignVendorError(msg: string): boolean {
     || msg.includes("This action is not allowed by the document's security settings");
 }
 
+// RDB-8224: some document-open failures are well-understood, expected
+// limitations (not real bugs) with no vendor-provided fallback UI (unlike
+// RDB-8133's password dialog) -- show a friendly replacement instead of the
+// raw technical message/stack. XFA (dynamic/static PDF forms) is a genuinely
+// unsupported format: the SDK's own Document wrapper constructor throws a
+// plain `Error("XFA is not supported.")` synchronously inside its async
+// openDocument() (used by both initialDocument and openDocument/openFile),
+// so it surfaces as a rejected open promise with no dialog of its own.
+function friendlyOpenErrorMessage(err: unknown): string | null {
+  const msg = err instanceof Error ? err.message : String(err);
+  if (msg.includes('XFA is not supported')) {
+    return 'This PDF uses XFA forms, which this editor does not support. Please use a PDF that doesn\'t rely on XFA forms.';
+  }
+  return null;
+}
+
+// The open failure propagates through several layers (initEditor -> openPdf
+// -> ontoolresult's own .catch), each of which used to independently format
+// and show(`... failed: ${err.message}\n${err.stack}`) -- once the first
+// layer swaps in a friendly message, a plain re-throw still carries an
+// Error whose OWN .stack always starts with "Error: <message>", so any
+// later layer's "raw" formatting duplicates the friendly text and appends
+// stack frames regardless of how clean the message itself is. Mark
+// friendly errors explicitly so every layer can tell them apart from a
+// genuine technical failure and just show the clean message as-is.
+function throwFriendlyOpenError(message: string): never {
+  const err = new Error(message);
+  (err as Error & { isFriendlyOpenError?: true }).isFriendlyOpenError = true;
+  throw err;
+}
+function isFriendlyOpenError(err: unknown): err is Error {
+  return err instanceof Error && (err as Error & { isFriendlyOpenError?: true }).isFriendlyOpenError === true;
+}
+
 window.addEventListener('error', (e) => {
   if (isBenignVendorError(e.message ?? '')) { beacon(`suppressed window.error: ${e.message}`); return; }
   show(`window.error: ${e.message}\n${e.filename}:${e.lineno}:${e.colno}`, true);
@@ -1093,7 +1127,8 @@ function initEditor(initialFile?: File): Promise<ViewerResult> {
     return result;
   })().catch((err: unknown) => {
     viewerMaskEl.style.display = 'none';
-    show(`init failed: ${(err as Error).message}\n${(err as Error).stack ?? ''}`, true);
+    const friendly = friendlyOpenErrorMessage(err);
+    show(friendly ?? `init failed: ${(err as Error).message}\n${(err as Error).stack ?? ''}`, true);
     // Clear the server-side _pendingDocOpen gate even on failure. Without
     // this, a genuinely failed/stuck editor init (bad license, WASM load
     // failure, etc.) left that gate permanently true, and every tool call
@@ -1102,6 +1137,13 @@ function initEditor(initialFile?: File): Promise<ViewerResult> {
     // turning a fast, correct "nothing is open" failure into a much slower
     // one for no benefit.
     (app as any).callServerTool({ name: 'report_viewer_result', arguments: { type: 'doc_opened' } }).catch(() => {});
+    // RDB-8224: openPdf()'s caller (ontoolresult) awaits this same promise
+    // chain and has its OWN catch that also calls show(err.message, true) --
+    // re-throwing the original raw err let that outer show() overwrite the
+    // friendly one just displayed above with the raw message/stack again.
+    // Re-throw a friendly-only Error instead so every downstream catch that
+    // re-displays err.message shows the same friendly text, not the raw one.
+    if (friendly) throwFriendlyOpenError(friendly);
     throw err;
   });
   return editorReady;
@@ -1160,13 +1202,14 @@ async function openPdf(token: string, name: string, filePath?: string): Promise<
     });
   });
 
+  let openErr: unknown;
   try {
     if (svc?.openDocument) {
       await svc.openDocument(file);
     } else {
       await (editor.ui?.pdfWebElement?.documentView?.openFile(file) ?? Promise.resolve());
     }
-  } catch { /* open error — the activeMatch wait below is the real gate */ }
+  } catch (err) { openErr = err; /* open error — the activeMatch wait below is the real gate */ }
 
   const activeVm = await Promise.race([
     activeMatch,
@@ -1178,6 +1221,11 @@ async function openPdf(token: string, name: string, filePath?: string): Promise<
   // must not leave later tool calls sitting through the doc-open grace window.
   (app as any).callServerTool({ name: 'report_viewer_result', arguments: { type: 'doc_opened' } }).catch(() => {});
   if (!activeVm) {
+    // RDB-8224: a well-understood open failure (e.g. XFA) never fires
+    // activeDocumentChanged$, so it always lands here after the timeout --
+    // show the friendly message instead of the generic "didn't switch" one.
+    const friendly = friendlyOpenErrorMessage(openErr);
+    if (friendly) { show(friendly, true); throwFriendlyOpenError(friendly); }
     const stillActive = (svc?.getActiveDocumentViewElement?.()?.documentView as any)?.getDocument?.()?.name;
     throw new Error(`Viewer did not switch to "${name}" (currently showing "${stillActive ?? 'no document'}") — refusing to run the command against the wrong file.`);
   }
@@ -4362,6 +4410,7 @@ app.ontoolresult = async (result) => {
         }
       }
     }).catch((err) => {
+      if (isFriendlyOpenError(err)) { show(err.message, true); return; }
       show(`open failed: ${(err as Error).message}\n${(err as Error).stack ?? ''}`, true);
     }).finally(() => {
       _openingDocument = null;
