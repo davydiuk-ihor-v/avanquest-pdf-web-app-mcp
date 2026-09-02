@@ -2258,7 +2258,11 @@ async function handleGetPageImage(data: { page: number; zoom: number }): Promise
     const pageIndex = data.page - 1;
     const doc = (activeDocumentView() as any)?.getDocument?.();
     if (!doc) throw new Error('document not available');
-    const result = await (doc as any).getPagePreview({ pageIndex, dpr: 1, zoom: data.zoom });
+    // RDB-8048: dpr is a fixed 2x pixel-density multiplier independent of the
+    // caller's zoom -- at dpr:1 the bitmap held up fine in Chat's small inline
+    // preview but looked blurry once Cowork's wider panel scaled the same
+    // low-res bytes up.
+    const result = await (doc as any).getPagePreview({ pageIndex, dpr: 2, zoom: data.zoom });
     const bytes: Uint8Array = result.body;
     let binary = '';
     const chunk = 8192;
