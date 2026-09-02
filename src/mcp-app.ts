@@ -20,7 +20,7 @@ type ViewerResult = {
 
 const statusEl = document.getElementById('status')!;
 const viewerEl = document.getElementById('viewer')!;
-// RDB-8038: covers the vendor's own brief "no document open" home screen
+// Covers the vendor's own brief "no document open" home screen
 // while the first PdfEditor() mount is still loading -- see initEditor().
 const viewerMaskEl = document.getElementById('viewer-mask')!;
 const { base, license, proxy } = window.PWV_CONFIG;
@@ -50,7 +50,7 @@ function b64ToBytes(b64: string): Uint8Array {
 }
 
 async function loadBytes(rel: string): Promise<Uint8Array> {
-  // RDB-8244: the server always answers 200 here (see sendModError in
+  // The server always answers 200 here (see sendModError in
   // server.ts) so this import() itself can't fail as a bare network error
   // anymore -- a missing/expired file surfaces as `mod.default === null`
   // with `error`/`code` we can act on, instead of a raw TypeError.
@@ -102,7 +102,7 @@ function show(msg: string, isError = false): void {
   }
 }
 
-// RDB-7732: dedicated, higher-contrast toast for every flow that writes bytes
+// Dedicated, higher-contrast toast for every flow that writes bytes
 // to disk via saveChunked() (Save, Save As, Extract Images/Pages, Export
 // Comments, Convert to Images, Split, Merge, Compress). Kept separate from
 // #status/show() above — that element is a plain text node shared by ~140
@@ -209,7 +209,7 @@ function isBenignVendorError(msg: string): boolean {
     // pass in the same frame (e.g. the page thumbnail grid reflowing after
     // its own resize). Harmless and unrelated to any operation's outcome.
     || msg.includes('ResizeObserver loop completed with undelivered notifications')
-    // RDB-8133: thrown whenever an edit command (Draw, Add text, etc.) hits
+    // Thrown whenever an edit command (Draw, Add text, etc.) hits
     // an owner-password restriction. The vendor's own UI already shows the
     // correct password dialog for this via a separate
     // documentView.ownerPasswordDialogShow() subscription -- this is not a
@@ -224,9 +224,9 @@ function isBenignVendorError(msg: string): boolean {
     || msg.includes("This action is not allowed by the document's security settings");
 }
 
-// RDB-8224: some document-open failures are well-understood, expected
+// Some document-open failures are well-understood, expected
 // limitations (not real bugs) with no vendor-provided fallback UI (unlike
-// RDB-8133's password dialog) -- show a friendly replacement instead of the
+// the owner-password dialog) -- show a friendly replacement instead of the
 // raw technical message/stack. XFA (dynamic/static PDF forms) is a genuinely
 // unsupported format: the SDK's own Document wrapper constructor throws a
 // plain `Error("XFA is not supported.")` synchronously inside its async
@@ -583,7 +583,7 @@ const app = new App(
   { name: 'Avanquest PDF Editor', version: '0.4.0' },
   { availableDisplayModes: ['inline', 'fullscreen'] },
 );
-// RDB-7843: command types that mutate the document — after any of these
+// Command types that mutate the document — after any of these
 // reports success, we auto-save the single persistent working copy (see
 // autoSaveWorkingCopy below) and stamp its path onto the same report rather
 // than touching each of these ~30 handlers individually.
@@ -598,7 +598,7 @@ const MUTATING_COMMAND_TYPES = new Set([
 ]);
 
 // Intercept report_viewer_result to automatically inject current doc state (_pageCount, _currentPage)
-// and, for mutating commands, the working-copy path (_workingFile — RDB-7843). This gives the server
+// and, for mutating commands, the working-copy path (_workingFile). This gives the server
 // fresh page count and save location after every operation so Claude doesn't work with stale state.
 {
   const _orig = (app as any).callServerTool.bind(app);
@@ -640,7 +640,7 @@ let _currentMode = 'inline';
 // Command poller awaits this before dispatching so stale document state is never read.
 let _openingDocument: Promise<void> | null = null;
 
-// RDB-7811/7842/7710: tool handlers used to read a module-level cache variable
+// Tool handlers used to read a module-level cache variable
 // holding "the active document", set once on open and refreshed defensively
 // before each command. Any gap in that refresh logic — a remount, a race, a
 // command path nobody thought to add a refresh to — let a handler run against
@@ -652,7 +652,7 @@ function activeDocumentView(): any {
   return _pdfWebService?.getActiveDocumentViewElement?.()?.documentView ?? null;
 }
 
-// RDB-8056: this host (Claude Desktop) runs on both Windows and macOS, and
+// This host (Claude Desktop) runs on both Windows and macOS, and
 // _currentFilePath reflects whatever OS opened the document ('\'-delimited
 // on Windows, '/' on macOS/Linux) -- joining with a hardcoded separator
 // produces a mixed-separator path on whichever platform doesn't match it.
@@ -663,7 +663,7 @@ function joinDirAndName(dir: string, name: string): string {
   return `${dir}${sep}${name}`;
 }
 let _pdfWebService: any = null;
-// RDB-7824: headless document loader (result.sdk.openDocument) for opening an
+// Headless document loader (result.sdk.openDocument) for opening an
 // OCR result File without touching the visible viewer/tabs -- see handleReadText.
 let _pdfSdk: any = null;
 
@@ -786,7 +786,7 @@ function collectAllElements(root: Element | ShadowRoot, out: Element[]): void {
 // cluster — id="pwv-header-top", right-aligned children under
 // id="pwv-header-top-right") sits flush against the right edge of its Shadow
 // DOM host, leaving no room for our Expand/Collapse button without
-// overlapping it (RDB-7720). `result.ui.pdfWebElement` (see initEditor) is a
+// overlapping it. `result.ui.pdfWebElement` (see initEditor) is a
 // real custom element mounted with an OPEN shadow root, so we can reach
 // straight into it via `.shadowRoot` right after mount instead of polling the
 // whole document for a class name. Pad #pwv-header-top so its right-aligned
@@ -885,13 +885,12 @@ document.addEventListener('pointerup', scheduleModalCheck, true);
 // 'inline' blip during ordinary tool operations that reverts to 'fullscreen'
 // again almost immediately — the pre-existing guard below ignores those.
 // But clicking the widget's own close ("X") button ALSO sends a genuine,
-// sustained 'inline' (confirmed via on-screen debug logging: no onteardown
-// call ever happens on close, just this hostcontextchanged), which looks
-// identical to the spurious case at the instant it arrives. The old guard
-// ignored it forever, so closing via "X" left us stuck applying the old
-// locked (large) fullscreen height forever after — RDB-7709's real cause.
-// Debounce instead: if 'inline' doesn't get superseded by a 'fullscreen'
-// signal shortly, treat it as real and unlock.
+// sustained 'inline' with no onteardown call, which looks identical to the
+// spurious case at the instant it arrives. A guard that ignores it forever
+// would leave the widget stuck applying the old locked (large) fullscreen
+// height even after closing via "X". Debounce instead: if 'inline' doesn't
+// get superseded by a 'fullscreen' signal shortly, treat it as real and
+// unlock.
 let _inlineConfirmTimer: ReturnType<typeof setTimeout> | undefined;
 
 app.addEventListener('hostcontextchanged', (ctx: any) => {
@@ -914,11 +913,10 @@ app.addEventListener('hostcontextchanged', (ctx: any) => {
 });
 
 // Defensive cleanup for hosts that do send a real ui/resource-teardown
-// request before unmounting the widget. Confirmed via on-screen debug
-// logging that clicking this widget's own close ("X") button in Claude
-// Desktop does NOT trigger this at all — that case (RDB-7709) is actually
-// fixed by the hostcontextchanged handler above. Kept here regardless, in
-// case some other host path does invoke it.
+// request before unmounting the widget. Clicking this widget's own close
+// ("X") button in Claude Desktop does NOT trigger this at all -- that case
+// is fixed by the hostcontextchanged handler above instead. Kept here
+// regardless, in case some other host path does invoke it.
 app.onteardown = async () => {
   _modalOpen = false;
   document.body.style.transform = '';
@@ -988,7 +986,7 @@ async function saveFileBytes(bytes: Uint8Array, defaultPath: string): Promise<vo
 
 let editorReady: Promise<ViewerResult> | null = null;
 
-// RDB-8130: the vendor's own document-open handling reads the PDF's embedded
+// The vendor's own document-open handling reads the PDF's embedded
 // /PageLayout viewer preference (Catalog entry) and, if present, re-applies
 // it via setLayout() one tick after open (a deferred setTimeout(...,0) in its
 // document-viewer-wrapper) -- silently overriding our own setLayout below.
@@ -1009,19 +1007,18 @@ function applyDefaultViewSettings(docVm: any): void {
 
   // 'continuous' = single-page view WITH scrolling in the vendor's view-mode
   // map (its "Enable scrolling" menu toggle switches single <-> continuous).
-  // RDB-7720 originally forced 'single' (no scrolling) here; reverted per the
-  // design decision on the ticket — the mobile/tablet web-app versions won't
-  // be redesigned, so scrolling must be enabled by default. Set explicitly
-  // rather than relying on the vendor default so this survives vendor bumps.
+  // Scrolling must be enabled by default since the mobile/tablet web-app
+  // versions won't be redesigned. Set explicitly rather than relying on the
+  // vendor default so this survives vendor bumps.
   try { docVm?.setLayout?.('continuous'); } catch (_) { /* non-fatal */ }
 
-  // RDB-8130 diagnostic confirmed the vendor's own re-application of the
-  // PDF's /PageLayout viewer preference does NOT go through setLayout() in a
-  // way that emits layoutChanged() -- a subscription to that observable
-  // never fired even though getLayout() had reverted to 'single' a few
-  // seconds later. Poll getLayout() instead and force it back for a short
-  // window after open; stop once the window passes so a later, genuine user
-  // choice to switch to single-page isn't fought.
+  // The vendor's own re-application of the PDF's /PageLayout viewer
+  // preference does NOT go through setLayout() in a way that emits
+  // layoutChanged() -- a subscription to that observable never fires even
+  // though getLayout() reverts to 'single' a few seconds later. Poll
+  // getLayout() instead and force it back for a short window after open;
+  // stop once the window passes so a later, genuine user choice to switch to
+  // single-page isn't fought.
   const layoutDeadline = Date.now() + LAYOUT_FIX_WINDOW_MS;
   _layoutFixInterval = setInterval(() => {
     if (Date.now() > layoutDeadline) {
@@ -1145,7 +1142,7 @@ function initEditor(initialFile?: File): Promise<ViewerResult> {
     // turning a fast, correct "nothing is open" failure into a much slower
     // one for no benefit.
     (app as any).callServerTool({ name: 'report_viewer_result', arguments: { type: 'doc_opened' } }).catch(() => {});
-    // RDB-8224: openPdf()'s caller (ontoolresult) awaits this same promise
+    // openPdf()'s caller (ontoolresult) awaits this same promise
     // chain and has its OWN catch that also calls show(err.message, true) --
     // re-throwing the original raw err let that outer show() overwrite the
     // friendly one just displayed above with the raw message/stack again.
@@ -1157,7 +1154,7 @@ function initEditor(initialFile?: File): Promise<ViewerResult> {
   return editorReady;
 }
 
-// RDB-8244: shown when a PDF referenced by chat history (or its token) is no
+// Shown when a PDF referenced by chat history (or its token) is no
 // longer reachable -- e.g. the file was deleted/moved since it was opened, or
 // the token expired across a remount. Both fileFromToken paths below funnel
 // a "file_not_found" code here instead of surfacing the raw fetch/fs error.
@@ -1205,7 +1202,7 @@ async function openPdf(token: string, name: string, filePath?: string): Promise<
   _pdfWebService = svc;
   _pdfSdk = (editor as any).sdk;
 
-  // RDB-7811: openDocument()/openFile() previously raced against a fixed
+  // openDocument()/openFile() previously raced against a fixed
   // timeout and, on timeout, fell through silently to whatever document was
   // already active — still the PREVIOUS file if the open was merely slow,
   // not actually failed. A command (e.g. split_pdf) then ran against the
@@ -1241,7 +1238,7 @@ async function openPdf(token: string, name: string, filePath?: string): Promise<
   // must not leave later tool calls sitting through the doc-open grace window.
   (app as any).callServerTool({ name: 'report_viewer_result', arguments: { type: 'doc_opened' } }).catch(() => {});
   if (!activeVm) {
-    // RDB-8224: a well-understood open failure (e.g. XFA) never fires
+    // A well-understood open failure (e.g. XFA) never fires
     // activeDocumentChanged$, so it always lands here after the timeout --
     // show the friendly message instead of the generic "didn't switch" one.
     const friendly = friendlyOpenErrorMessage(openErr);
@@ -1259,7 +1256,7 @@ const COMPRESS_QUALITY: Record<string, number> = {
 
 async function saveChunked(bytes: Uint8Array, targetPath: string, label = 'Saving', silent = false, _isRetry = false): Promise<void> {
   const totalSize = bytes.length;
-  // RDB-8046: every call gets its own id so the server never mixes this
+  // Every call gets its own id so the server never mixes this
   // export's chunks with a concurrent one for the same token (auto-save on
   // command, the debounced isModified auto-save, and manual Save/Save
   // As/Export can all fire close together for the same document).
@@ -1273,14 +1270,14 @@ async function saveChunked(bytes: Uint8Array, targetPath: string, label = 'Savin
       name: 'save_pdf',
       arguments: { token: _currentToken, savePath: targetPath, chunk: btoa(bin), offset, totalSize, saveId },
     });
-    // RDB-8115: an MCP tool error comes back as a normal resolved result
+    // An MCP tool error comes back as a normal resolved result
     // (isError: true / an `error` field in the JSON body), not a rejected
     // promise -- this await alone never caught save_pdf failing (e.g. an
     // expired file token), so every caller's try/catch never fired and
     // saveFileBytes went straight to "PDF saved successfully" regardless.
     const data = JSON.parse((result.content[0] as { text: string }).text) as { error?: string };
     if (data.error) {
-      // RDB-8115: renewing the token on every get_viewer_command poll only
+      // Renewing the token on every get_viewer_command poll only
       // helps while the widget is actively polling -- a document left open
       // through a long enough background/inactive stretch (throttled iframe,
       // sleep, etc.) can still outlive TOKEN_TTL_MS with no poll ever landing
@@ -1308,7 +1305,7 @@ async function saveChunked(bytes: Uint8Array, targetPath: string, label = 'Savin
   }
 }
 
-// RDB-7843: after every edit, silently re-export the current document into a
+// After every edit, silently re-export the current document into a
 // single persistent working copy (<original name>_updated.pdf, next to the
 // original) instead of leaving edits unsaved in memory or writing a fresh
 // file per action. Re-derives/reuses _workingFilePath per open document —
@@ -1329,7 +1326,7 @@ function getWorkingFilePath(): string | null {
   return _workingFilePath;
 }
 
-// RDB-8046: the command-success trigger below and the debounced isModified
+// The command-success trigger below and the debounced isModified
 // trigger can both fire within moments of each other for the same edit. Two
 // overlapping exports are wasteful even now that the server can no longer
 // mix their bytes together, so coalesce: a call that arrives while one is
@@ -1370,7 +1367,7 @@ async function autoSaveWorkingCopy(): Promise<string | null> {
   }
 }
 
-// RDB-7843 safety net: MUTATING_COMMAND_TYPES only catches edits driven by our
+// MUTATING_COMMAND_TYPES only catches edits driven by our
 // own chat-issued commands. A user editing the document directly through the
 // vendor viewer's own UI (dragging an annotation, typing in a form field,
 // clicking its built-in rotate button, ...) never goes through that command
@@ -1411,9 +1408,9 @@ function watchDocumentModifications(docVm: any): void {
 }
 
 function startViewerCommandPoller(): void {
-  // RDB-7842: setInterval fires on a fixed clock regardless of whether the
+  // setInterval fires on a fixed clock regardless of whether the
   // previous tick's async callback has finished — a slow command (SDK call,
-  // or the RDB-7843 auto-save export+upload after every edit) left multiple
+  // or the auto-save export+upload after every edit) left multiple
   // ticks running concurrently against the active document, racing each
   // other. That's a very plausible source of "PDF stops responding after
   // several operations" and the resulting server-side poll timeout. A single
@@ -1424,7 +1421,7 @@ function startViewerCommandPoller(): void {
     if (!editorReady || processing) return;
     processing = true;
     try {
-      // RDB-7811: pass this widget's own token so the server can tell a stale,
+      // Pass this widget's own token so the server can tell a stale,
       // still-mounted widget (an earlier chat turn's render) apart from the
       // one covering the model's most recent open — see get_viewer_command.
       const result = await (app as any).callServerTool({ name: 'get_viewer_command', arguments: { token: _currentToken } });
@@ -1636,7 +1633,7 @@ function startViewerCommandPoller(): void {
 // Report a handler failure back to the server so its pollViewerResult-based
 // tool returns the real error to the model instead of sitting out its timeout.
 // Success-only reporting was how "add a green square" could fail in the viewer
-// while the model confidently told the user it was done (RDB-7878).
+// while the model confidently told the user it was done.
 async function reportFailure(type: string, err: unknown): Promise<void> {
   await (app as any).callServerTool({
     name: 'report_viewer_result',
@@ -1659,7 +1656,7 @@ async function handleRotatePages(data: { angle: number; pages: number[] | null }
     setTimeout(() => { statusEl.style.display = 'none'; }, 3000);
     // rotate_pages responds to Claude immediately (fire-and-forget on the server
     // side), so this report can't affect that tool's own reply — but it still
-    // feeds the shared _pageCount/_workingFile tracking (RDB-7843) that the
+    // feeds the shared _pageCount/_workingFile tracking that the
     // *next* tool call's response will include.
     await (app as any).callServerTool({
       name: 'report_viewer_result',
@@ -1702,7 +1699,8 @@ async function handleInsertBlankPage(data: { afterPage: number | null }): Promis
       : `after page ${index}`;
     show(`Inserted blank page ${where}`);
     setTimeout(() => { statusEl.style.display = 'none'; }, 3000);
-    // See handleRotatePages above: feeds RDB-7843 tracking for the next tool call.
+    // See handleRotatePages above: feeds the shared _pageCount/_workingFile
+    // tracking for the next tool call.
     await (app as any).callServerTool({
       name: 'report_viewer_result',
       arguments: { type: 'insert_blank_page', json: JSON.stringify({ success: true }) },
@@ -1801,7 +1799,8 @@ async function handleAddImageToPage(data: {
 
     show(`Image added to page ${data.page}`);
     setTimeout(() => { statusEl.style.display = 'none'; }, 3000);
-    // See handleRotatePages above: feeds RDB-7843 tracking for the next tool call.
+    // See handleRotatePages above: feeds the shared _pageCount/_workingFile
+    // tracking for the next tool call.
     await (app as any).callServerTool({
       name: 'report_viewer_result',
       arguments: { type: 'add_image_to_page', json: JSON.stringify({ success: true }) },
@@ -1813,7 +1812,7 @@ async function handleAddImageToPage(data: {
 }
 
 // ── Engine call retry ────────────────────────────────────────────────────────
-// RDB-7908: createAnnotation/changeAnnotationProperties/createTextBlock/
+// createAnnotation/changeAnnotationProperties/createTextBlock/
 // editPageText occasionally throw a transient native
 // `json.exception.type_error.30x` (nlohmann::json) on otherwise-identical,
 // minimal params — confirmed by reproducing the exact same call three times
@@ -1830,12 +1829,10 @@ function isTransientEngineError(err: unknown): boolean {
 }
 
 async function withEngineRetry<T>(fn: () => Promise<T>, attempts = 6, baseDelayMs = 200, label = 'engine call'): Promise<T> {
-  // RDB-8167 diagnostic: log every attempt (not just the final failure) via
-  // show()'s silent beacon channel -- enable "Enable debug logging" in this
-  // extension's Configure screen, reproduce, then check Claude Desktop's
-  // main.log for `[iframe] engineRetry:` lines to see the full attempt
-  // sequence (timing, which attempt succeeded/exhausted, exact error each
-  // time) instead of only the final outcome we already show on failure.
+  // Log every attempt (not just the final failure) via show()'s silent
+  // beacon channel, so the full attempt sequence (timing, which attempt
+  // succeeded/exhausted, exact error each time) is visible in debug logging
+  // instead of only the final outcome shown on failure.
   for (let i = 0; i < attempts; i++) {
     try {
       const result = await fn();
@@ -1846,7 +1843,7 @@ async function withEngineRetry<T>(fn: () => Promise<T>, attempts = 6, baseDelayM
       show(`engineRetry: ${label} attempt ${i + 1}/${attempts} failed: ${msg}`);
       if (i === attempts - 1 || !isTransientEngineError(err)) throw err;
       // Backoff instead of a fixed delay: 3 quick retries weren't enough to
-      // reliably clear this (RDB-7908 add_form_field still surfaced the error
+      // reliably clear this (add_form_field still surfaced the error
       // after 3x250ms), so give the engine progressively more time to settle.
       await new Promise<void>((r) => setTimeout(r, baseDelayMs * (i + 1)));
     }
@@ -1904,7 +1901,8 @@ async function handleAddAnnotation(data: AnnotationCommand): Promise<void> {
     await withEngineRetry(() => (doc as any).createAnnotation({ pageIndex, params }));
     show(`Added ${data.shape} on page ${data.page}`);
     setTimeout(() => { statusEl.style.display = 'none'; }, 3000);
-    // See handleRotatePages above: feeds RDB-7843 tracking for the next tool call.
+    // See handleRotatePages above: feeds the shared _pageCount/_workingFile
+    // tracking for the next tool call.
     await (app as any).callServerTool({
       name: 'report_viewer_result',
       arguments: { type: 'add_annotation', json: JSON.stringify({ success: true }) },
@@ -2170,7 +2168,7 @@ async function handleReadDocumentInfo(): Promise<void> {
     const doc = (activeDocumentView() as any)?.getDocument?.();
     if (!doc) throw new Error('document not available');
     const info: Record<string, unknown> = {
-      // RDB-7811: this tool has no path argument — it always reports on
+      // This tool has no path argument — it always reports on
       // whichever document is currently active, which is wrong the moment
       // the model calls it to check a file it's about to open (e.g. to plan
       // split ranges) rather than one it already opened. Surfacing the
@@ -2218,7 +2216,7 @@ async function handleReadAnnotations(data: { page: number | null }): Promise<voi
     const startPage = data.page !== null ? data.page - 1 : 0;
     const endPage = data.page !== null ? data.page - 1 : pageCount - 1;
     for (let pi = startPage; pi <= endPage; pi++) {
-      // RDB-8047: read annotations off the document's own public `annotations`
+      // Read annotations off the document's own public `annotations`
       // model (doc.getPage(i).annotations) instead of the vendor SDK's
       // internal `pdfEditor.getPageAnnotations()` -- (doc as any).pdfEditor
       // was reaching for a true JS private class field the SDK never exposes
@@ -2280,7 +2278,7 @@ async function handleGetPageImage(data: { page: number; zoom: number }): Promise
   }
 }
 
-// RDB-7824: reads one page's text via the same PageText mechanism regardless
+// Reads one page's text via the same PageText mechanism regardless
 // of whether `doc` is the live viewer document or a headless document opened
 // just to read back an OCR result (see handleReadText) -- both expose the
 // same getPages()/loadPageContent()/getPageText() surface.
@@ -2294,7 +2292,7 @@ async function getPageTextString(doc: any, pageIndex: number): Promise<string> {
   return text;
 }
 
-// RDB-7824: online-tool commands (document.ocr/convert/translate) take a
+// Online-tool commands (document.ocr/convert/translate) take a
 // caller-supplied IApiOperationClient -- the SDK ships no default
 // implementation, integrators are expected to provide their own. The actual
 // HTTP work can't happen here though: this iframe's sandbox CSP blocks
@@ -2421,7 +2419,7 @@ async function handleUpdateAnnotation(data: { page: number; annotIndex: number; 
     const doc = (activeDocumentView() as any)?.getDocument?.();
     if (!doc) throw new Error('document not available');
     const pageIndex = data.page - 1;
-    // RDB-8047: changeAnnotationProperties is a public method directly on
+    // changeAnnotationProperties is a public method directly on
     // DocumentModel (data: {pageIndex, annotIndex, properties}, type:
     // AnnotsTypes) -- it never took a documentId, and never lived on
     // doc.pdfEditor (see handleReadAnnotations above for why that was always
@@ -2635,7 +2633,7 @@ async function handleAddBookmark(data: { page: number; title: string | null; par
   try {
     const doc = (activeDocumentView() as any)?.getDocument?.();
     if (!doc) throw new Error('document not available');
-    // RDB-7869: without an explicit index, the engine inserts each new
+    // Without an explicit index, the engine inserts each new
     // bookmark at the front of its parent's children instead of the end, so
     // several add_bookmark calls in one request land in reverse order.
     // Append explicitly by passing the current sibling count as the index.
@@ -3098,7 +3096,7 @@ async function handleReadFormFields(): Promise<void> {
     const raw: any[] = doc.acroforms ?? [];
     // Read the real on-state values of button fields once so checkboxes and, in
     // particular, radio groups report the exact values needed to select them.
-    const { map: onValuesByField, debugWidgets } = await collectButtonOnValues(doc);
+    const { map: onValuesByField } = await collectButtonOnValues(doc);
     const fields = raw.map((f: any) => {
       let type = f.type as string;
       if (type === 'Tx') type = 'text';
@@ -3127,20 +3125,16 @@ async function handleReadFormFields(): Promise<void> {
           if (onValues.length > 0) {
             entry.options = onValues.slice();
           } else if (Array.isArray(f.C) && f.C.length > 0) {
-            // RDB-7889: a radio group where no option has ever been selected
-            // has no on-value discoverable via V on any widget (V only
-            // reflects the CURRENT toggle state, so a never-picked option
-            // never appears there) -- but the field's own JSON exposes its
-            // export values directly under "C" regardless of selection
-            // state (IFormField.C in the SDK types). Use that instead of
-            // guessing blind.
+            // A radio group where no option has ever been selected has no
+            // on-value discoverable via V on any widget (V only reflects the
+            // CURRENT toggle state, so a never-picked option never appears
+            // there) -- but the field's own JSON exposes its export values
+            // directly under "C" regardless of selection state (IFormField.C
+            // in the SDK types). Use that instead of guessing blind.
             entry.options = f.C.map((v: unknown) => String(v));
-          } else {
-            // RDB-7889: nothing pre-selected, and no "C" export-values list
-            // either — dump the raw widget JSON so the actual shape is
-            // visible instead of failing silently.
-            entry._debug_no_options_raw_widgets = debugWidgets.get(f.fieldName) ?? [];
           }
+          // Otherwise: nothing pre-selected and no "C" export-values list
+          // either -- leave options unset rather than guessing.
         } else if (onValues.length === 1) {
           // Single checkbox: report its on-value ("yes"/"true"/"1" also work).
           entry.on_value = onValues[0];
@@ -3192,23 +3186,20 @@ async function tryChangeAcroform(doc: any, field: string, value: string): Promis
 // so we must read it rather than guess. A single scan returns a map from field
 // name to its distinct on-values, in widget order (which matches the visual
 // order of the radio options — index i is the (i+1)-th option).
-// RDB-7889 diagnostic: `debugWidgets`, keyed the same as the returned map,
-// collects the raw annotation JSON for every widget that contributed nothing
-// to its field's on-values (V was empty/"Off"). V only reflects a widget's
-// CURRENT toggle state, so a radio option that has never been selected can't
-// be discovered through it — surfaced here so read_form_fields can show the
-// real widget shape and reveal whether the engine exposes each widget's own
-// possible on-value under some other (untyped) key, e.g. an AP/N
-// appearance-state dictionary, instead of guessing blind.
-async function collectButtonOnValues(doc: any): Promise<{ map: Map<string, string[]>; debugWidgets: Map<string, unknown[]> }> {
+// `widgetCounts`, keyed the same as the returned map, counts widgets that
+// contributed nothing to their field's on-values (V was empty/"Off"). V only
+// reflects a widget's CURRENT toggle state, so a radio option that has never
+// been selected can't be discovered through it -- the count lets callers
+// report "N widgets found, no selectable value" instead of guessing blind.
+async function collectButtonOnValues(doc: any): Promise<{ map: Map<string, string[]>; widgetCounts: Map<string, number> }> {
   const map = new Map<string, string[]>();
-  const debugWidgets = new Map<string, unknown[]>();
-  if (doc?.getPage === undefined) return { map, debugWidgets };
+  const widgetCounts = new Map<string, number>();
+  if (doc?.getPage === undefined) return { map, widgetCounts };
   const pageCount = (doc.getNumPages?.() ?? 0) as number;
   for (let pi = 0; pi < pageCount; pi++) {
-    // RDB-8047: same public annotations model as handleReadAnnotations --
-    // this used to go through doc.pdfEditor.getPageAnnotations(), which was
-    // always undefined (see the note there).
+    // Same public annotations model as handleReadAnnotations -- this used to
+    // go through doc.pdfEditor.getPageAnnotations(), which was always
+    // undefined (see the note there).
     const page = doc.getPage?.(pi);
     const annots: any[] = page?.annotations ?? [];
     for (const ann of annots) {
@@ -3218,9 +3209,7 @@ async function collectButtonOnValues(doc: any): Promise<{ map: Map<string, strin
       if (!field) continue;
       const v = typeof native.V === 'string' ? native.V : '';
       if (v === '' || v.toLowerCase() === 'off') {
-        let dbg = debugWidgets.get(field);
-        if (!dbg) { dbg = []; debugWidgets.set(field, dbg); }
-        dbg.push(native);
+        widgetCounts.set(field, (widgetCounts.get(field) ?? 0) + 1);
         continue;
       }
       let list = map.get(field);
@@ -3228,7 +3217,7 @@ async function collectButtonOnValues(doc: any): Promise<{ map: Map<string, strin
       if (!list.includes(v)) list.push(v);
     }
   }
-  return { map, debugWidgets };
+  return { map, widgetCounts };
 }
 
 async function getButtonOnValues(doc: any, fieldName: string): Promise<string[]> {
@@ -3301,7 +3290,7 @@ async function handleUpdateFormField(data: { field_name: string; value: string }
       const currentlyChecked = currentValue !== '' && currentValue.toLowerCase() !== 'off';
       let onValues = await getButtonOnValues(doc, data.field_name);
       if (onValues.length === 0 && Array.isArray(field.C) && field.C.length > 0) {
-        // RDB-7889: same fallback as read_form_fields (see the comment
+        // Same fallback as read_form_fields (see the comment
         // there) -- a never-selected radio group has nothing discoverable
         // via V, but the field's own "C" export-values list still works.
         onValues = field.C.map((v: unknown) => String(v));
@@ -3329,13 +3318,9 @@ async function handleUpdateFormField(data: { field_name: string; value: string }
           if (onValues.length > 0) {
             list = `Its options (in order) are: ${onValues.map((v, i) => `${i + 1}=${v}`).join(', ')}.`;
           } else {
-            // RDB-7889 diagnostic: surface the raw widget annotations in the
-            // error text itself — the most reliable channel we have, since
-            // log-based debugging (beacon/console.error) is currently not
-            // reaching us. Remove once the real fix lands.
-            const { debugWidgets } = await collectButtonOnValues(doc);
-            const raw = debugWidgets.get(data.field_name) ?? [];
-            list = `No selectable options were found on its widgets. [debug: ${raw.length} widget(s) found for this field, raw=${JSON.stringify(raw)}]`;
+            const { widgetCounts } = await collectButtonOnValues(doc);
+            const count = widgetCounts.get(data.field_name) ?? 0;
+            list = `No selectable options were found on its ${count} widget(s).`;
           }
           throw new Error(`"${data.field_name}" is a radio group; pass one of its option values or a 1-based index. ${list}`);
         }
@@ -3462,8 +3447,8 @@ async function handleDeleteWatermark(data: { range: string[] | null }): Promise<
   try {
     const doc = (activeDocumentView() as any)?.getDocument?.();
     if (!doc) throw new Error('document not available');
-    // null range = whole document (the server normalizes ["all"] to null,
-    // RDB-7893) — expand to an explicit 1-N, the only form the engine parses.
+    // null range = whole document (the server normalizes ["all"] to null) --
+    // expand it to an explicit 1-N, the only form the engine parses.
     const range = data.range && data.range.length > 0 ? data.range : [`1-${(doc as any).getNumPages?.() ?? 1}`];
     await (doc as any).deleteWatermark({ range });
     show('Watermark removed');
@@ -3624,10 +3609,10 @@ async function handleExtractPages(data: { Range: string[] | null; outputPath: st
     const bytes = new Uint8Array(raw instanceof ArrayBuffer ? raw : (raw as ArrayBufferView).buffer);
     await saveChunked(bytes, data.outputPath, 'Saving extracted PDF');
     showSaveSuccess('Pages extracted successfully', data.outputPath);
-    // RDB-7894: report_viewer_result gets auto-stamped with the SOURCE
-    // document's _pageCount (RDB-7843's augmentation, for state-freshness on
-    // mutating commands) — but extract_pages doesn't mutate/replace the open
-    // document, so that count is the wrong one to show for the new file.
+    // report_viewer_result gets auto-stamped with the SOURCE document's
+    // _pageCount (for state-freshness on mutating commands) -- but
+    // extract_pages doesn't mutate/replace the open document, so that count
+    // is the wrong one to show for the new file.
     // Compute the real extracted count from the resolved ranges instead.
     const extractedPages = new Set<string>();
     for (const r of Range) for (const p of parseSplitRange(r, totalPages)) extractedPages.add(p);
@@ -4005,7 +3990,7 @@ async function handleAddFormField(data: AddFormFieldCommand): Promise<void> {
     const pdfTop    = ph - (data.y / 100) * ph;
     let pdfBottom   = ph - ((data.y + data.height) / 100) * ph;
 
-    // RDB-8051: a listbox sized well beyond its option count renders as a
+    // A listbox sized well beyond its option count renders as a
     // mostly-empty box (the caller/model's height % isn't tied to how many
     // options it asked for). A description hint isn't enforcement -- clamp
     // the box height here so it actually reflects the number of options.
@@ -4035,12 +4020,12 @@ async function handleAddFormField(data: AddFormFieldCommand): Promise<void> {
       }
     }
 
-    // RDB-8051: without an explicit font size, the engine renders the
+    // Without an explicit font size, the engine renders the
     // field's own value/options far too large for the box (looks auto-fit to
     // the widget height). checkbox/radio/button don't display readable text
     // (glyph or CA caption instead), so only the text-bearing types need it
     // -- applied via the post-creation reinforcement patch below, not here
-    // (see RDB-8167 comment above params.BC).
+    // (see comment above params.BC).
     const FIELD_FONT_SIZE = 10;
 
     const params: Record<string, unknown> = {
@@ -4052,7 +4037,7 @@ async function handleAddFormField(data: AddFormFieldCommand): Promise<void> {
     if (data.field_type === 'button' && data.label != null) params.CA = data.label;
     if (data.bg_color != null) params.BG = data.bg_color;
     if (data.border_color != null) params.BC = data.border_color;
-    // RDB-8167: the vendor's own UI widget-creation code (ui/chunks --
+    // The vendor's own UI widget-creation code (ui/chunks --
     // the class backing its "drag to create a form field" toolbar tool)
     // unconditionally sets O:{} for ComboBox/ListBox at creation time, even
     // though it's immediately replaced by the "Items" dialog's own separate
@@ -4065,7 +4050,7 @@ async function handleAddFormField(data: AddFormFieldCommand): Promise<void> {
     // the shipped product; the real options still go through the separate
     // changeAnnotationProperties patch below unchanged.
     if (data.field_type === 'dropdown' || data.field_type === 'listbox') params.O = {};
-    // RDB-8167: Fnt in createAnnotation's own params destabilizes ComboBox/
+    // Fnt in createAnnotation's own params destabilizes ComboBox/
     // ListBox creation the same way N and (earlier) O did -- same
     // json.exception.type_error.302 signature, reproduced with nothing else
     // non-minimal in the payload. The font-size reinforcement patch below
@@ -4084,11 +4069,8 @@ async function handleAddFormField(data: AddFormFieldCommand): Promise<void> {
     // withEngineRetry above) — createAnnotation itself, or the follow-up
     // changeAnnotationProperties — instead of one generic "add_form_field
     // error" that gives no way to tell which call and payload were involved.
-    // RDB-8167 diagnostic: log the exact outgoing payload once per call site
-    // (it's identical across retries of the same call, so no need to repeat
-    // it per attempt) -- enable "Enable debug logging" in this extension's
-    // Configure screen and check Claude Desktop's main.log for `[iframe]
-    // engineSend:` lines to see precisely what we send, not just the error.
+    // Log the exact outgoing payload once per call site (it's identical
+    // across retries of the same call, so no need to repeat it per attempt).
     show(`engineSend: createAnnotation(pageIndex=${pageIndex}, params=${JSON.stringify(params)})`);
     let response: any;
     try {
@@ -4115,7 +4097,7 @@ async function handleAddFormField(data: AddFormFieldCommand): Promise<void> {
     // own "Items" dialog applies options via a separate changeAnnotationProperties
     // call after creation, so mirror that here: locate the just-created
     // annotation's index on the page and patch its options in as a second step.
-    // RDB-8051: Fnt is patched separately from O below -- bundling both into
+    // Fnt is patched separately from O below -- bundling both into
     // one changeAnnotationProperties call corrupted O in testing (the engine
     // returned garbage bytes in field.O instead of the requested strings).
     if (data.field_type === 'dropdown' || data.field_type === 'listbox') {
@@ -4153,7 +4135,7 @@ async function handleAddFormField(data: AddFormFieldCommand): Promise<void> {
         } catch { /* font reinforcement is best-effort */ }
       }
     } else if (data.field_type === 'text') {
-      // RDB-8051: same font-size reinforcement as above, for the one other
+      // Same font-size reinforcement as above, for the one other
       // text-bearing type. Best-effort: a missed patch just leaves the
       // (already-attempted) createAnnotation Fnt param as the only source of
       // truth, same as before this fix existed.
@@ -4167,7 +4149,7 @@ async function handleAddFormField(data: AddFormFieldCommand): Promise<void> {
       } catch { /* font reinforcement is best-effort */ }
     }
 
-    // RDB-8167: passing N (requested field name) directly in createAnnotation's
+    // Passing N (requested field name) directly in createAnnotation's
     // params destabilized ComboBox/ListBox creation the same way O once did --
     // N belongs to the FormField schema, not the Widget annotation's own
     // creation payload (see the api_reference.md CreateAnnot/Widget section:
@@ -4189,7 +4171,7 @@ async function handleAddFormField(data: AddFormFieldCommand): Promise<void> {
       } catch { /* requested name is best-effort -- engine auto-assigns one regardless */ }
     }
 
-    // RDB-7907: passing V in the createAnnotation params above is unreliable
+    // Passing V in the createAnnotation params above is unreliable
     // for text fields — the engine sometimes creates the field without ever
     // applying it, leaving the value empty until a separate update_form_field
     // call. changeAcroformValue is the same call update_form_field already
@@ -4201,7 +4183,7 @@ async function handleAddFormField(data: AddFormFieldCommand): Promise<void> {
     }
 
     // For non-button types, add a plain text label above the field via createTextBlock.
-    // RDB-8051: createTextBlock's position is the block's TOP-left corner (text
+    // createTextBlock's position is the block's TOP-left corner (text
     // grows downward from it -- confirmed by handleAddTextToPage using the same
     // convention). The label used to be placed at exactly pdfTop, the field
     // rect's own top edge, so it rendered growing straight down INTO the field
@@ -4290,7 +4272,7 @@ async function handleSplit(cmd: ToolCommand): Promise<void> {
       saved.push({ path: outPath, pages: pages.length });
     }
     showSaveSuccess(`Split into ${saved.length} file${saved.length !== 1 ? 's' : ''}`, outputDir || undefined);
-    // RDB-7811: split_pdf's own tool response returns immediately (it has to,
+    // split_pdf's own tool response returns immediately (it has to,
     // to deliver the open target to this widget in the first place) — this is
     // the only place the REAL outcome (actual source page count, actual files
     // produced) is known. Report it so get_last_operation_result can hand the
@@ -4404,7 +4386,7 @@ function shouldAutoFullscreen(token: string): Promise<boolean> {
     .catch(() => true);
 }
 
-// RDB-7710: same remount problem as fullscreen arbitration above, but for the
+// Same remount problem as fullscreen arbitration above, but for the
 // command itself — ontoolresult re-fires with the same open target (and thus
 // the same command) on every remount, not just on a genuinely new tool call.
 // Without this, a scroll-back-into-view or reopening an old chat re-ran
@@ -4422,8 +4404,8 @@ function shouldRunOperation(opId: string, outputPath?: string): Promise<boolean>
 
 type OpenTarget = { token?: string; name?: string; filePath?: string; command?: ToolCommand };
 
-// Every observed host strips `structuredContent` from `ontoolresult` (confirmed
-// via debug logging: absent on every firing, live open or historical replay).
+// Every observed host strips `structuredContent` from `ontoolresult` (absent
+// on every firing, live open or historical replay).
 // `get_pending_open`'s fallback returns a single server-process-wide "last
 // opened" pointer, which is wrong for a remounted widget once some OTHER
 // conversation has opened a different document since. The tool's own `content`

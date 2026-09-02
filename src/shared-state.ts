@@ -233,7 +233,7 @@ export function getFileToken(token: string): FileEntry | null {
   return entry;
 }
 
-// RDB-8115: a document left open (and polled) for longer than TOKEN_TTL_MS
+// A document left open (and polled) for longer than TOKEN_TTL_MS
 // had its file token expire out from under it even with zero real idle time
 // -- save_pdf then failed with "token expired", but the widget never checked
 // that response (see the saveChunked fix), so the user saw "Saved!" for a
@@ -250,7 +250,7 @@ export function touchFileToken(token: string): void {
   writeJson('tokens.json', tokens);
 }
 
-// ── save_pdf chunk buffers (RDB-7731) ───────────────────────────────────────
+// ── save_pdf chunk buffers ───────────────────────────────────────
 // Chunks of one save_pdf upload used to accumulate in a process-local
 // Map<string, Buffer[]>, on the (false, in Cowork mode) assumption that they
 // all arrive at the same server instance. When a later chunk lands in a

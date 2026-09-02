@@ -43,7 +43,7 @@ if (!LICENSE_KEY) {
 // document locations. `display_pdf` rejects anything outside these roots, so
 // the model can't coax the extension into reading arbitrary files.
 //
-// RDB-7806: a `multiple: true` user_config value can only be expanded by
+// A `multiple: true` user_config value can only be expanded by
 // @anthropic-ai/mcpb when it is substituted as its own standalone `args` array
 // entry -- each selected folder becomes a separate argv string after
 // --allowed-dirs (see that package's replaceVariables: array-context
@@ -95,7 +95,7 @@ const ALLOWED_DIRS: string[] = parseAllowedDirsConfig()
     }
   });
 
-// RDB-7806: "the first valid folder can be used as the default PDF folder" --
+// "the first valid folder can be used as the default PDF folder" --
 // the folder the various export/save tools below suggest when the caller
 // doesn't specify an explicit output path.
 const DEFAULT_PDF_DIR: string = ALLOWED_DIRS[0] ?? path.join(os.homedir(), 'Downloads');
@@ -167,12 +167,12 @@ const DIAG_HTML_PATH = path.join(__dirname, 'diag.html');
 // File tokens live in shared-state.ts (disk-backed) so a token minted by the
 // MCP-side instance resolves in the widget-side instance in Cowork mode.
 //
-// RDB-7731: save_pdf's chunk buffer is disk-backed too (shared.writeSaveChunk
+// save_pdf's chunk buffer is disk-backed too (shared.writeSaveChunk
 // et al.) for the same reason -- Cowork can service two chunks of one upload
 // from different processes, so a process-local buffer silently lost chunks it
 // never saw while still reporting success. See shared-state.ts.
 //
-// RDB-8046: keyed by a per-export saveId (minted client-side per saveChunked()
+// Keyed by a per-export saveId (minted client-side per saveChunked()
 // call), NOT by the long-lived file token. The widget can trigger overlapping
 // exports for the same document (auto-save-on-command, the debounced
 // isModified auto-save, and manual Save/Save As/Export all reuse the same
@@ -181,7 +181,7 @@ const DIAG_HTML_PATH = path.join(__dirname, 'diag.html');
 // payloads into a truncated/corrupt file. saveId gives each export its own
 // buffer so concurrent exports can never interleave.
 
-// RDB-8046: even with per-export buffers, two complete exports finishing
+// Even with per-export buffers, two complete exports finishing
 // around the same time can still race on the final fs.writeFile to the same
 // path -- Node's default 'w' flag truncates on open, so a second writer's
 // open() can truncate the file out from under a first writer that is still
@@ -207,7 +207,7 @@ const RELAY_SAVE_NOTE_INSTRUCTION = ' IMPORTANT: the response includes a bracket
 
 // The viewer's WASM engine hard-rejects any color string that doesn't start
 // with '#' (the "Color string should start with '#'" toast) — and until
-// RDB-7878 the annotation tools forwarded whatever the model sent and even
+// the annotation tools forwarded whatever the model sent and even
 // reported success. Models do occasionally pass CSS color names ("green") or
 // bare hex ("00FF00") despite the hex examples in every description, so
 // normalize those into engine-accepted "#RRGGBB" instead of failing, and
@@ -241,7 +241,7 @@ function normalizeShape(value: string, allowed: readonly string[]): string | nul
   return allowed.includes(mapped) ? mapped : null;
 }
 
-// RDB-7898 / RDB-7893: the range descriptions document ["all"] and models do
+// The range descriptions document ["all"] and models do
 // send it — but the engine's range parser only understands numeric forms
 // ("1-3", "5") and treats "all" as an empty range ("'pages' is an empty
 // range"). Strip "all"-style entries here; a null result tells the widget to
@@ -325,7 +325,7 @@ function saveFullscreenGrantedTokens(tokens: Set<string>): void {
   } catch { /* non-fatal — worst case, next restart re-grants fullscreen once */ }
 }
 
-// RDB-7710: same remount problem as fullscreen arbitration above, but for
+// Same remount problem as fullscreen arbitration above, but for
 // file-writing commands (compress_pdf/merge_pdf/split_pdf) instead of the
 // display mode. A widget's ontoolresult re-fires with the same open target —
 // carrying the same command — on every remount (scrolling back into view,
@@ -515,7 +515,7 @@ async function startAssetServer(): Promise<{ port: number; baseUrl: string }> {
     res.type('application/javascript').send(`self.__pwv_xhr_result = ${JSON.stringify(payload)};`);
   });
 
-  // RDB-8244: a non-2xx status here makes the browser's dynamic import()
+  // A non-2xx status here makes the browser's dynamic import()
   // fail as a bare network error ("Failed to fetch dynamically imported
   // module") *before* it ever reads the response body -- so every reason we
   // used to embed as a JS comment (token expired, file deleted, forbidden
@@ -695,7 +695,7 @@ async function main(): Promise<void> {
         url: z.string().optional().describe('URL of a remote PDF to download and open (http or https)'),
       },
       // outputSchema used to be declared here (structuredContent forwarding to
-      // the app iframe on older Claude Desktop) but was dropped for RDB-7878:
+      // the app iframe on older Claude Desktop) but was dropped because
       // it's what makes the SDK stamp a JSON Schema `$schema` dialect the newer
       // Cowork validator rejects outright at attach time (see PR
       // modelcontextprotocol/typescript-sdk#2653), and ontoolresult's own
@@ -758,7 +758,7 @@ async function main(): Promise<void> {
     },
   );
 
-  // RDB-8115: renewing the token on every get_viewer_command poll (below)
+  // Renewing the token on every get_viewer_command poll (below)
   // only helps while the widget is actually polling. A document left open
   // through a long background/inactive stretch (throttled iframe, laptop
   // sleep, or just genuinely not touched for a while) can still outlive
@@ -827,7 +827,7 @@ async function main(): Promise<void> {
       await shared.writeSaveChunk(bufferKey, offset, chunkBuf);
       const bytesReceived = offset + chunkBuf.length;
       if (bytesReceived >= totalSize) {
-        // RDB-7731: confirm what's actually durable on disk for this saveId --
+        // Confirm what's actually durable on disk for this saveId --
         // earlier chunks may have been written by a different process
         // instance (Cowork), so this call's own offset can't prove it.
         const persistedSize = await shared.getSaveBufferSize(bufferKey);
@@ -841,7 +841,7 @@ async function main(): Promise<void> {
         const tempPath = shared.getSaveBufferPath(bufferKey);
         await serializeWrite(targetPath, () => fs.copyFile(tempPath, targetPath));
         await shared.removeSaveBuffer(bufferKey);
-        console.error(`[save_pdf] saved ${persistedSize} bytes -> ${targetPath}`);
+        debug(`[save_pdf] saved ${persistedSize} bytes -> ${targetPath}`);
         return {
           content: [{ type: 'text', text: JSON.stringify({ done: true, savedPath: targetPath }) }],
         };
@@ -852,13 +852,13 @@ async function main(): Promise<void> {
     },
   );
 
-  // RDB-7824: the widget iframe's sandbox CSP blocks fetch() to arbitrary
+  // The widget iframe's sandbox CSP blocks fetch() to arbitrary
   // origins (see mcp-app.ts's beacon() comment -- it can't even fetch() its
   // own local server, only this server's own process can make outbound
   // network calls). So the OCR round trip to Avanquest's online API has to
   // happen HERE, not in the widget: the widget uploads the extracted PDF in
-  // chunks (mirroring save_pdf's disk-backed buffer from RDB-7731, reusing
-  // the same shared-state.ts helpers), this server does the actual
+  // chunks (mirroring save_pdf's disk-backed buffer, reusing the same
+  // shared-state.ts helpers), this server does the actual
   // start/poll/download against the documented public contract
   // (developers.avanquest.com/api-reference/getting-started), and hands the
   // result back to the widget as a file token (the same mechanism
@@ -1024,7 +1024,7 @@ async function main(): Promise<void> {
         const buf = await fs.readFile(readPath);
         return { content: [{ type: 'text', text: JSON.stringify({ base64: buf.toString('base64') }) }] };
       } catch (err) {
-        // RDB-8244: tag ENOENT so the widget can show a friendly "file no
+        // Tag ENOENT so the widget can show a friendly "file no
         // longer exists" message instead of the raw fs error.
         const code = (err as NodeJS.ErrnoException).code === 'ENOENT' ? 'file_not_found' : undefined;
         return { content: [{ type: 'text', text: JSON.stringify({ error: (err as Error).message, code }) }] };
@@ -1046,7 +1046,7 @@ async function main(): Promise<void> {
           .describe('Compression level: max=maximum compression (smallest file, lower quality), min=minimum compression (largest file, best quality). Default: medium'),
         outputPath: z.string().optional().describe('Where to save the compressed file. Defaults to original filename with _compressed suffix'),
       },
-      // RDB-7878: no outputSchema — see the note on display_pdf above.
+      // No outputSchema — see the note on display_pdf above.
       _meta: { ui: { resourceUri } },
     },
     async ({ path: requestedPath, compression, outputPath }) => {
@@ -1066,8 +1066,8 @@ async function main(): Promise<void> {
         filePath,
         command: { type: 'compress_pdf', compression: compression ?? 'medium', outputPath: savePath, opId: randomUUID() },
       };
-      console.error(`[compress_pdf] minted opId=${structured.command.opId} token=${token} outputPath=${savePath}`);
-      // RDB-7811: unlike display_pdf, this tool never flagged a doc-open as
+      debug(`[compress_pdf] minted opId=${structured.command.opId} token=${token} outputPath=${savePath}`);
+      // Unlike display_pdf, this tool never flagged a doc-open as
       // pending — so a read-only tool (e.g. read_document_information) called
       // around the same time could race past get_viewer_command's pending-open
       // guard and run against whatever document was active before this open,
@@ -1096,7 +1096,7 @@ async function main(): Promise<void> {
         paths: z.array(z.string()).min(2).describe('Absolute paths to PDF files to merge, in order'),
         outputPath: z.string().optional().describe('Where to save the merged file. Defaults to <firstName>_merged.pdf next to the first file'),
       },
-      // RDB-7878: no outputSchema — see the note on display_pdf above.
+      // No outputSchema — see the note on display_pdf above.
       _meta: { ui: { resourceUri } },
     },
     async ({ paths, outputPath }) => {
@@ -1121,8 +1121,8 @@ async function main(): Promise<void> {
         filePath: firstPath,
         command: { type: 'merge_pdf', files, outputPath: savePath, opId: randomUUID() },
       };
-      console.error(`[merge_pdf] minted opId=${structured.command.opId} outputPath=${savePath}`);
-      // RDB-7811: see compress_pdf above — flag the open as pending so a
+      debug(`[merge_pdf] minted opId=${structured.command.opId} outputPath=${savePath}`);
+      // See compress_pdf above — flag the open as pending so a
       // concurrent read-only tool call can't race ahead of the switch.
       shared.setDocOpenPending(true);
       shared.setViewerCommand(null);
@@ -1150,7 +1150,7 @@ async function main(): Promise<void> {
         pagesPerFile: z.coerce.number().int().min(1).optional().describe('Split into equal chunks of N pages each. Alternative to ranges.'),
         outputDir: z.string().optional().describe('Directory for output files. Defaults to same directory as the input file.'),
       },
-      // RDB-7878: no outputSchema — see the note on display_pdf above.
+      // No outputSchema — see the note on display_pdf above.
       _meta: { ui: { resourceUri } },
     },
     async ({ path: requestedPath, ranges, pagesPerFile, outputDir }) => {
@@ -1172,8 +1172,8 @@ async function main(): Promise<void> {
         filePath,
         command: { type: 'split_pdf', ranges, pagesPerFile, outputDir: outDir, baseName, opId: randomUUID() },
       };
-      console.error(`[split_pdf] minted opId=${structured.command.opId} outputDir=${outDir}`);
-      // RDB-7811: see compress_pdf above — flag the open as pending so a
+      debug(`[split_pdf] minted opId=${structured.command.opId} outputDir=${outDir}`);
+      // See compress_pdf above — flag the open as pending so a
       // concurrent read-only tool call can't race ahead of the switch. This
       // is the exact gap that let read_document_information report the
       // PREVIOUS document's metadata while a split_pdf-triggered open to a
@@ -1194,10 +1194,10 @@ async function main(): Promise<void> {
   // The viewer command/result channel, the doc-open marker, the last open
   // target (get_pending_open fallback for hosts that strip structuredContent —
   // Claude Desktop <=1.20186), and the docNote inputs (_lastDocState /
-  // _lastWorkingFile, RDB-7843) all live in shared-state.ts now: in Cowork mode
+  // _lastWorkingFile) all live in shared-state.ts now: in Cowork mode
   // the model's tool calls and the widget's callServerTool requests are served
   // by SEPARATE server processes, so in-memory variables never crossed over and
-  // every viewer-bound tool timed out (RDB-7878).
+  // every viewer-bound tool timed out.
   // Mirrors mcp-app.ts's MUTATING_COMMAND_TYPES — the report_viewer_result
   // `type` values that represent an actual document edit (as opposed to a
   // read, like get_view_state or read_annotations, which also round-trip
@@ -1212,7 +1212,7 @@ async function main(): Promise<void> {
     'delete_page_number', 'insert_page_number', 'delete_text_blocks', 'set_security_permissions',
     'search_and_redact', 'format_text', 'add_text_to_page', 'add_form_field', 'format_selected_text',
   ]);
-  // RDB-7894: these produce a standalone new file whose own response text
+  // These produce a standalone new file whose own response text
   // already states the real outcome (including, for extract_pages, the
   // actual extracted page count) — appending the *currently open* viewer
   // document's page-count note here doesn't just add noise, it's actively
@@ -1456,7 +1456,7 @@ async function main(): Promise<void> {
     {
       title: 'Circle Text',
       annotations: { readOnlyHint: false, destructiveHint: false },
-      description: 'Find all occurrences of a word or phrase in the currently open PDF and draw a shape around each one. If the user has not specified shape or color -- ask them before calling: "Ð§ÐµÐ¼ Ð¾Ð±Ð²Ð¾Ð´Ð¸Ð¼ -- Ð¿Ñ€ÑÐ¼Ð¾ÑƒÐ³Ð¾Ð»ÑŒÐ½Ð¸ÐºÐ¾Ð¼ Ð¸Ð»Ð¸ Ð¾Ð²Ð°Ð»Ð¾Ð¼? ÐšÐ°ÐºÐ¾Ð¹ Ñ†Ð²ÐµÑ‚? ÐÐ° Ð²ÑÐµÑ... ÑÑ‚Ñ€Ð°Ð½Ð¸Ñ†Ð°Ñ... Ð¸Ð»Ð¸ Ñ‚Ð¾Ð»ÑŒÐºÐ¾ Ð½Ð° Ð¾Ð´Ð½Ð¾Ð¹?" Available shapes: rectangle (default) or oval. Colors: any hex value, e.g. red=#FF0000, blue=#0000FF, green=#00AA00.',
+      description: 'Find all occurrences of a word or phrase in the currently open PDF and draw a shape around each one. If the user has not specified shape or color, ask them before calling. Available shapes: rectangle (default) or oval. Colors: any hex value, e.g. red=#FF0000, blue=#0000FF, green=#00AA00.',
       inputSchema: {
         text: z.string().min(1).describe('Text to search for and circle (case-insensitive)'),
         page: z.coerce.number().int().min(1).optional().describe('Limit to a specific 1-based page number. Omit to circle on all pages.'),
@@ -1882,7 +1882,7 @@ async function main(): Promise<void> {
       },
     },
     async ({ pages }) =>
-      // RDB-7824: OCR of scanned pages is an async upload/poll/download round
+      // OCR of scanned pages is an async upload/poll/download round
       // trip to Avanquest's online API (see mcp-app.ts's createApiOperationClient)
       // -- can genuinely take well over the old 30s ceiling, which is what
       // produced the generic "make sure a PDF is open" timeout this ticket
@@ -2905,7 +2905,7 @@ async function main(): Promise<void> {
       // Claimed before with a known output path -> allow again only if that
       // file is now missing from disk.
       const allow = priorPath === undefined || (priorPath !== '' && !existsSync(priorPath));
-      console.error(`[claim_operation] opId=${opId} priorPath=${priorPath ?? '(none)'} allow=${allow} (${Object.keys(executed).length} executed opIds on file)`);
+      debug(`[claim_operation] opId=${opId} priorPath=${priorPath ?? '(none)'} allow=${allow} (${Object.keys(executed).length} executed opIds on file)`);
       if (allow) {
         executed[opId] = outputPath ?? priorPath ?? '';
         saveExecutedOps(executed);
@@ -2930,9 +2930,9 @@ async function main(): Promise<void> {
       if (shared.isDocOpenPending()) {
         return { content: [{ type: 'text' as const, text: JSON.stringify({ command: null }) }] };
       }
-      // RDB-8115: renew THIS widget's own file token on every poll, BEFORE the
-      // "latest document" gate below -- an earlier chat turn's widget (see the
-      // RDB-7811 comment on that gate) is still a legitimately open document
+      // Renew THIS widget's own file token on every poll, BEFORE the
+      // "latest document" gate below -- an earlier chat turn's widget (see
+      // the comment on that gate) is still a legitimately open document
       // that must keep being able to save even though it no longer wins
       // command routing. Gating this on "latest" too (as an earlier version
       // of this fix did) left every non-latest-but-still-open document's
@@ -2940,7 +2940,7 @@ async function main(): Promise<void> {
       // actively polled, reproducing the exact "save fails after ~30 min"
       // bug for any document other than the most recently opened one.
       if (token) shared.touchFileToken(token);
-      // RDB-7811: earlier chat turns' display_pdf/split_pdf/etc. renders leave
+      // Earlier chat turns' display_pdf/split_pdf/etc. renders leave
       // their widget iframe mounted (scrolled out of view, not destroyed), and
       // each one independently polls this same shared command channel — with
       // no check here, whichever stale widget's poller tick won the race
@@ -2982,7 +2982,7 @@ async function main(): Promise<void> {
       } else if (type === 'search') {
         shared.setSearchResult({ count: count ?? 0, pages: pages ?? [] });
       } else if (type === 'auto_save') {
-        // RDB-7843: a side-channel note from the isModified-driven safety-net
+        // A side-channel note from the isModified-driven safety-net
         // save (mcp-app.ts's watchDocumentModifications) — not a poll target
         // for any pending tool call, so it must bypass pendingViewerResult:
         // overwriting that here could clobber a same-tick result some other
@@ -3008,7 +3008,7 @@ async function main(): Promise<void> {
     },
   );
 
-  // RDB-7811: split_pdf/merge_pdf/compress_pdf must return immediately to
+  // split_pdf/merge_pdf/compress_pdf must return immediately to
   // deliver the open target to the widget (ontoolresult only fires once the
   // host has actually delivered that response) — so their own tool response
   // can't carry the real outcome; the operation is still running when they
