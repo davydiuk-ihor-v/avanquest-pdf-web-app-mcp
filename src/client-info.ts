@@ -7,11 +7,15 @@ export type ClientInfo = {
 
 let _clientInfo: ClientInfo | undefined;
 
+const DEBUG = process.env.PWV_DEBUG === '1' || process.env.PWV_DEBUG === 'true';
+
 export function setupClientInfo(server: McpServer): void {
   server.server.oninitialized = () => {
     _clientInfo = server.server.getClientVersion();
-    const isClaudeClient = _clientInfo?.name?.toLowerCase().includes('claude') ?? false;
-    console.error(`[avanquest-pdf] client connected: ${JSON.stringify(_clientInfo)} isClaudeClient=${isClaudeClient}`);
+    if (DEBUG) {
+      const isClaudeClient = _clientInfo?.name?.toLowerCase().includes('claude') ?? false;
+      console.error(`[avanquest-pdf] client connected: ${JSON.stringify(_clientInfo)} isClaudeClient=${isClaudeClient}`);
+    }
   };
 }
 

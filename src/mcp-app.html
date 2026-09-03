@@ -50,7 +50,7 @@
       #save-toast[data-state="error"] #save-toast-icon svg { stroke: #f87171; }
       @keyframes pwv-save-toast-spin { to { transform: rotate(360deg); } }
       #viewer { height: 720px; width: 100%; }
-      /* RDB-8038: PdfEditor() briefly renders its own "no document open"
+      /* PdfEditor() briefly renders its own "no document open"
          home screen inside #viewer while mounting + loading the initial
          document -- mask it until initEditor() confirms the first document
          is ready (or failed). Below #status/#fullscreen-btn so those still
