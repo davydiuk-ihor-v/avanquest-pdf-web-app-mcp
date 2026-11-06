@@ -231,7 +231,8 @@ function isBenignVendorError(msg: string): boolean {
 // unsupported format: the SDK's own Document wrapper constructor throws a
 // plain `Error("XFA is not supported.")` synchronously inside its async
 // openDocument() (used by both initialDocument and openDocument/openFile),
-// so it surfaces as a rejected open promise with no dialog of its own.
+// so it surfaces as a rejected open promise (or, for initialDocument, via
+// PdfEditor's onError -- see initEditor()) with no dialog of its own.
 function friendlyOpenErrorMessage(err: unknown): string | null {
   const msg = err instanceof Error ? err.message : String(err);
   if (msg.includes('XFA is not supported')) {
@@ -670,6 +671,10 @@ let _pdfSdk: any = null;
 // Resolved by the global documentOpened$ subscription when a new document finishes loading.
 let _resolveDocOpen: (() => void) | null = null;
 
+// Set by initEditor() when the viewer mounted but its `initialDocument` failed
+// to open; consumed (and cleared) by openPdf()'s first-open branch.
+let _initialOpenError: unknown = undefined;
+
 let _searchRanges: any[] = [];
 let _searchRects: (any | null)[] = []; // pre-computed PDF-coord bounding rects per range
 let _searchIndex = 0;
@@ -1046,8 +1051,17 @@ function initEditor(initialFile?: File): Promise<ViewerResult> {
     if (typeof PdfEditor !== 'function') {
       throw new Error(`PdfEditor not exported. Got: ${typeof PdfEditor}`);
     }
+    // Since @avanquest/pdf-web-viewer 0.10.18 a failed `initialDocument` open
+    // (XFA, damaged file, cancelled password prompt) no longer rejects
+    // PdfEditor(): the viewer mounts empty and the error goes to onError,
+    // which the SDK calls before PdfEditor() resolves. Capture it here so
+    // openPdf() can still report the open as failed.
+    let initialOpenError: unknown = undefined;
     const result = await PdfEditor({
       container: viewerEl,
+      onError: (err: Error) => {
+        if (initialOpenError === undefined) initialOpenError = err;
+      },
       license,
       basePath: `${base}public`,
       openDocumentsInNewTab: false,
@@ -1110,6 +1124,7 @@ function initEditor(initialFile?: File): Promise<ViewerResult> {
         await saveFileBytes(bytes, defaultPath);
       },
     });
+    if (initialFile) _initialOpenError = initialOpenError;
     const wrapperShadowRoot = (result as any).ui?.pdfWebElement?.shadowRoot as ShadowRoot | undefined;
     if (wrapperShadowRoot) ensureTopBarGap(wrapperShadowRoot);
     const svc = (result as any).ui?.pdfWebService;
@@ -1193,6 +1208,15 @@ async function openPdf(token: string, name: string, filePath?: string): Promise<
     // documentOpened$ fires during PdfEditor() init, BEFORE our subscription is wired up.
     // Send doc_opened manually so the server-side _pendingDocOpen gate is cleared.
     (app as any).callServerTool({ name: 'report_viewer_result', arguments: { type: 'doc_opened' } }).catch(() => {});
+    const initErr = _initialOpenError;
+    _initialOpenError = undefined;
+    if (initErr !== undefined) {
+      // The viewer stays mounted (empty), so the next display_pdf call opens
+      // into it through the branch below instead of re-mounting.
+      const friendly = friendlyOpenErrorMessage(initErr);
+      if (friendly) { show(friendly, true); throwFriendlyOpenError(friendly); }
+      throw initErr instanceof Error ? initErr : new Error(String(initErr));
+    }
     return;
   }
   // Viewer already mounted (subsequent display_pdf call): open into it.
